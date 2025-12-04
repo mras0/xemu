@@ -17,19 +17,24 @@ enum {
     EFLAGS_BIT_IF,
     EFLAGS_BIT_DF,
     EFLAGS_BIT_OF,
-    //IOPL...
+    EFLAGS_BIT_IOPL,
+    EFLAGS_BIT_NT = 14,
+    EFLAGS_BIT_VM = 17,
 };
 static_assert(EFLAGS_BIT_OF == 11);
 
-constexpr std::uint32_t EFLAGS_MASK_CF = 1 << EFLAGS_BIT_CF; // 0x001
-constexpr std::uint32_t EFLAGS_MASK_PF = 1 << EFLAGS_BIT_PF; // 0x004
-constexpr std::uint32_t EFLAGS_MASK_AF = 1 << EFLAGS_BIT_AF; // 0x010
-constexpr std::uint32_t EFLAGS_MASK_ZF = 1 << EFLAGS_BIT_ZF; // 0x040
-constexpr std::uint32_t EFLAGS_MASK_SF = 1 << EFLAGS_BIT_SF; // 0x080
-constexpr std::uint32_t EFLAGS_MASK_TF = 1 << EFLAGS_BIT_TF; // 0x100
-constexpr std::uint32_t EFLAGS_MASK_IF = 1 << EFLAGS_BIT_IF; // 0x200
-constexpr std::uint32_t EFLAGS_MASK_DF = 1 << EFLAGS_BIT_DF; // 0x400
-constexpr std::uint32_t EFLAGS_MASK_OF = 1 << EFLAGS_BIT_OF; // 0x800
+constexpr std::uint32_t EFLAGS_MASK_CF = 1 << EFLAGS_BIT_CF; // 0x0000`0001
+constexpr std::uint32_t EFLAGS_MASK_PF = 1 << EFLAGS_BIT_PF; // 0x0000`0004
+constexpr std::uint32_t EFLAGS_MASK_AF = 1 << EFLAGS_BIT_AF; // 0x0000`0010
+constexpr std::uint32_t EFLAGS_MASK_ZF = 1 << EFLAGS_BIT_ZF; // 0x0000`0040
+constexpr std::uint32_t EFLAGS_MASK_SF = 1 << EFLAGS_BIT_SF; // 0x0000`0080
+constexpr std::uint32_t EFLAGS_MASK_TF = 1 << EFLAGS_BIT_TF; // 0x0000`0100
+constexpr std::uint32_t EFLAGS_MASK_IF = 1 << EFLAGS_BIT_IF; // 0x0000`0200
+constexpr std::uint32_t EFLAGS_MASK_DF = 1 << EFLAGS_BIT_DF; // 0x0000`0400
+constexpr std::uint32_t EFLAGS_MASK_OF = 1 << EFLAGS_BIT_OF; // 0x0000`0800
+constexpr std::uint32_t EFLAGS_MASK_IOPL = 3 << EFLAGS_BIT_IOPL; // 0x0000`3000
+constexpr std::uint32_t EFLAGS_MASK_NT = 1 << EFLAGS_BIT_NT; // 0x0000`4000
+constexpr std::uint32_t EFLAGS_MASK_VM = 1 << EFLAGS_BIT_VM; // 0x0002`0000
 
 static inline bool EvalCond(std::uint32_t flags, std::uint8_t cond)
 {

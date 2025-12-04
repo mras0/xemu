@@ -102,6 +102,8 @@ public:
     std::uint8_t inU8(uint16_t port, uint16_t) override;
     void outU8(uint16_t port, uint16_t, std::uint8_t value) override;
 
+    void render();
+
 private:
     DrawFunction onDraw_;
     RamHandler videoMem_;
@@ -115,8 +117,6 @@ private:
 
     uint8_t registerIndex_;
     uint8_t mc6845Registers_[static_cast<int>(MC6845RegisterIndex::Max)];
-
-    void render();
 };
 
 CGA::impl::impl(SystemBus& bus)
@@ -159,9 +159,12 @@ std::uint64_t CGA::impl::nextAction()
 
 void CGA::impl::render()
 {
+    if (!(mcr_ & MCR_MASK_VIDEO_ENABLE))
+        return;
+
     const auto startAddress = mc6845Registers_[MC6845RegisterIndex::StartAddressH] << 8 | mc6845Registers_[MC6845RegisterIndex::StartAddressL];
     if (startAddress)
-        throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:2X} startAddress=0x{:X}", mcr_, startAddress) };
+        throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:02X} startAddress=0x{:X}", mcr_, startAddress) };
 
     auto vidMem = &videoMem_.data()[0];
 
@@ -205,7 +208,7 @@ void CGA::impl::render()
         }
     } else {
         if ((mcr_ & ~MCR_MASK_TEXT_CLOUMNS) != (MCR_MASK_VIDEO_ENABLE | MCR_MASK_BLINK))
-            throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:2X} 0b{:08b}", mcr_, mcr_) };
+            throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:02X} 0b{:08b}", mcr_, mcr_) };
 
         const int textW = mcr_ & MCR_MASK_TEXT_CLOUMNS ? 80 : 40;
         const int textH = 25;
@@ -254,6 +257,9 @@ std::uint8_t CGA::impl::inU8(uint16_t port, uint16_t)
 {
     uint8_t value = 0;
     switch (port) {
+    case 0x3D5:
+        std::println("CGA: Warning read from port {:04X}", port);
+        return 0;
     case 0x3DA:
         value = STAT_MASK_LP_TRIGGER | STAT_MASK_LP_SWITCH;
         if (cycles_ >= vsyncStartSys)
@@ -262,6 +268,7 @@ std::uint8_t CGA::impl::inU8(uint16_t port, uint16_t)
             value |= STAT_MASK_DISPLAY_INACTIVE;
         break;
     default:
+        std::println("CGA TODO");
         return IOHandler::inU8(port, 0);
     }
     return value;
@@ -299,6 +306,7 @@ void CGA::impl::outU8(uint16_t port, uint16_t, std::uint8_t value)
         palette_ = value;
         break;
     default:
+        std::println("CGA TODO");
         IOHandler::outU8(port, 0, value);
     }
 }
@@ -314,4 +322,9 @@ CGA::~CGA() = default;
 void CGA::setDrawFunction(const DrawFunction& onDraw)
 {
     impl_->setDrawFunction(onDraw);
+}
+
+void CGA::forceRedraw()
+{
+    impl_->render();
 }

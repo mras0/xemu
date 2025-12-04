@@ -50,12 +50,15 @@ std::string ModeString(uint8_t mode)
 
 class i8237a_DMAController::impl : public IOHandler, public CycleObserver {
 public:
-    impl(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase)
+    impl(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase, bool wordMode)
         : bus_ { bus }
+        , wordMode_ { wordMode }
+        , channelCountOffset_ { static_cast<uint8_t>(wordMode ? 4 : 0) }
     {
         assert(pageIoBase == 0x81 || pageIoBase == 0x89);
+        assert(wordMode_ == (pageIoBase == 0x89));
         bus.addCycleObserver(*this);
-        bus.addIOHandler(ioBase, 16, *this, true);
+        bus.addIOHandler(ioBase, wordMode_ ? 32 : 16, *this, true);
         bus.addIOHandler(pageIoBase, 3, *this, true);
         bus.addIOHandler(pageIoBase|7, 1, *this, true);
         reset();
@@ -65,7 +68,7 @@ public:
     {
         msbFlipFlop_ = false;
         mask_ = 0xf;
-        enabled_ = false;
+        enabled_ = true;
         std::memset(channels_, 0, sizeof(channels_));
     }
 
@@ -83,12 +86,16 @@ public:
     }
 
     std::uint8_t inU8(std::uint16_t port, std::uint16_t offset) override;
+    std::uint16_t inU16(std::uint16_t port, std::uint16_t offset) override;
     void outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value) override;
+    void outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value) override;
 
     void startGet(uint8_t channel, DMAHandler& handler);
 
 private:
     SystemBus& bus_;
+    const bool wordMode_;
+    const uint8_t channelCountOffset_;
     bool msbFlipFlop_;
     uint8_t mask_;
     bool enabled_;
@@ -101,10 +108,19 @@ private:
         uint8_t page;
         uint8_t mode;
     } channels_[4];
+
+    std::string desc() const
+    {
+        return std::format("DMA{}-{}: ", channelCountOffset_, channelCountOffset_ + 3);
+    }
+
+    void internalWrite8(std::uint16_t port, std::uint16_t regNum, std::uint8_t value);
 };
 
 std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
 {
+    if (wordMode_)
+        throw std::runtime_error { std::format("{}Unsupported 8-bit read from register {:02X} (offset {}) -- wordMode!", desc(), port, offset) };
     switch (offset) {
     case 0x00:
     case 0x01:
@@ -123,22 +139,73 @@ std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t 
     case 0x08:
         //Status register
         //Should be: REQ3|REQ2|REQ1|REQ0|TC3|TC2|TC1|TC0 (TC3-0 are cleared on read)
-        std::println("DMA: TODO read of status register, just returning 1 (TC0)");
+        std::println("{}TODO read of status register, just returning 1 (TC0)", desc());
         return 1; // Return TC0 for IBM PC XT BIOS
     default:
-        throw std::runtime_error { std::format("DMA: Unsupported read from register {:02X} (offset {})", port, offset) };
+        throw std::runtime_error { std::format("{}Unsupported read from register {:02X} (offset {})", desc(), port, offset) };
+    }
+}
+
+std::uint16_t i8237a_DMAController::impl::inU16(std::uint16_t port, std::uint16_t offset)
+{
+    if (!wordMode_)
+        return IOHandler::inU16(port, offset);
+
+    throw std::runtime_error { std::format("{}Unsupported 16-bit read from register {:02X} (offset {})!", desc(), port, offset) };
+}
+
+static constexpr std::uint16_t firstActionReg = 8;
+
+void i8237a_DMAController::impl::internalWrite8(std::uint16_t port, std::uint16_t regNum, std::uint8_t value)
+{
+    switch (regNum) {
+    case 0x08: // Command
+        std::println("{}Command {:02X}", desc(), value);
+        if (value & ~4)
+            throw std::runtime_error { std::format("DMA: Unsupported write value {:02X} (0b{:08b}) for port {:04X} regNum {:02X}", value, value, port, regNum) };
+        enabled_ = (value & 4) == 0;
+        break;
+    case 0x0A: // Mask single channel
+        std::println("{}{}masking channel {}", desc(), value & 4 ? "" : "un", value & 3);
+        if (value & 4)
+            mask_ |= 1 << (value & 3);
+        else
+            mask_ &= ~(1 << (value & 3));
+        break;
+    case 0x0B: // Mode write
+        std::println("{}Channel {} setting mode to {:02X} {}", desc(), value & MODE_MASK_SEL, value, ModeString(value));
+        channels_[value & MODE_MASK_SEL].mode = value & ~MODE_MASK_SEL;
+        break;
+    case 0x0C: // Clear flip/flop
+        msbFlipFlop_ = false;
+        break;
+    case 0x0D: // Master reset
+        std::println("{}Master reset {:02X}", desc(), value);
+        reset();
+        break;
+    default:
+        throw std::runtime_error { std::format("{}Unsupported internal 8-bit write value {:02X} (0b{:08b}) for port {:02X} regNum {:02x}", desc(), value, value, port, regNum) };
     }
 }
 
 void i8237a_DMAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value)
 {
-    if (port & 0x80) {
+    if (port >= 0x80 && port <= 0x8F) {
         const auto idx = (port & 7) == 7 ? 0 : (port & 3) == 3 ? 1
             : (port & 3) == 1                                  ? 2
                                                                : 3;
-        std::println("DMA: Channel {} setting page register to {:02x}",   idx, value);
+        std::println("{}Channel {} setting page register to {:02x}",   desc(), idx, value);
         channels_[idx].page = value;
         return;
+    }
+
+    if (wordMode_) {
+        const std::uint16_t regNum = offset >> 1;
+        if (!(offset & 1) && regNum >= firstActionReg) {
+            internalWrite8(port, regNum, value);
+            return;
+        }
+        throw std::runtime_error { std::format("{}Unsupported 8-bit write value {:02X} (0b{:08b}) for port {:04X} {:04b}  -- wordMode", desc(),value, value, port, offset) };
     }
 
     switch (offset) {
@@ -158,44 +225,39 @@ void i8237a_DMAController::impl::outU8(std::uint16_t port, std::uint16_t offset,
         } else {
             reg2 = reg = (reg & 0xff00) | value;
         }
-        std::println("DMA: Channel {} setting {} to {:04X} [{}SB]", offset >> 1, offset & 1 ? "count" : "address", reg, msbFlipFlop_ ? 'M' : 'L');
+        std::println("{}Channel {} setting {} to {:04X} [{}SB]", desc(), offset >> 1, offset & 1 ? "count" : "address", reg, msbFlipFlop_ ? 'M' : 'L');
         msbFlipFlop_ = !msbFlipFlop_;
         break;
     }
-    case 0x08: // Command
-        std::println("DMA: Command {:02X}", value);
-        if (value & ~4)
-            throw std::runtime_error { std::format("DMA: Unsupported write value {:02X} (0b{:08b}) for port {:04X} {:04b}", value, value, port, offset) };
-        enabled_ = (value & 4) == 0;
-        break;
-    case 0x0A: // Mask single channel
-        std::println("DMA: {}masking channel {}", value & 4 ? "": "un", value & 3);
-        if (value & 4)
-            mask_ |= 1 << (value & 3);
-        else
-            mask_ &= ~(1 << (value & 3));
-        break;
-    case 0x0B: // Mode write
-        std::println("DMA: Channel {} setting mode to {:02X} {}", value & MODE_MASK_SEL, value, ModeString(value));
-        channels_[value & MODE_MASK_SEL].mode = value & ~MODE_MASK_SEL;
-        break;
-    case 0x0C: // Clear flip/flop
-        msbFlipFlop_ = false;
-        break;
-    case 0x0D: // Master reset
-        std::println("DMA: Master reset {:02X}", value);
-        reset();
-        break;
     default:
-        throw std::runtime_error { std::format("DMA: Unsupported write value {:02X} (0b{:08b}) for port {:04X} {:04b}", value, value, port, offset) };
+        internalWrite8(port, offset, value);
     }
 }
+
+void i8237a_DMAController::impl::outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value)
+{
+    if (!wordMode_) {
+        IOHandler::outU16(port, offset, value);
+        return;
+    }
+
+    if (!(offset & 1)) {
+        const uint16_t regNum = offset >> 1;
+        if (regNum >= firstActionReg && (value >> 8) == 0) {
+            internalWrite8(port, regNum, static_cast<uint8_t>(value));
+            return;
+        }
+    }
+
+    throw std::runtime_error { std::format("{}Unsupported 16-bit write value {:04X} (0b{:016b}) for port {:04X} {:04b}", desc(), value, value, port, offset) };
+}
+
 
 void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
 {
     assert(channel < 4);
     auto& ch = channels_[channel];
-    std::println("DMA: Starting get on channel {} address = 0x{:X} count = 0x{:X}", channel, ch.currentAddress | ch.page << 16, ch.currentCount);
+    std::println("{}Starting get on channel {} address = 0x{:X} count = 0x{:X}", desc(), channel, ch.currentAddress | ch.page << 16, ch.currentCount);
 
     if (!enabled_)
         throw std::runtime_error { std::format("DMA: Unsupported write (get) - channel {}, DMA controller disabled", channel) };
@@ -222,8 +284,8 @@ void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
     handler.dmaDone();
 }
 
-i8237a_DMAController::i8237a_DMAController(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase)
-    : impl_ { std::make_unique<impl>(bus, ioBase, pageIoBase) }
+i8237a_DMAController::i8237a_DMAController(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase, bool wordMode)
+    : impl_ { std::make_unique<impl>(bus, ioBase, pageIoBase, wordMode) }
 {
 }
 i8237a_DMAController::~i8237a_DMAController() = default;

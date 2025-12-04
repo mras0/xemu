@@ -19,10 +19,47 @@ else()
     endif()
 endif()
 
-
 if (WIN32)
     add_definitions("-DWIN32 -D_WIN32 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x600")
 endif()
+
+find_program(NASM nasm)
+if (NOT NASM)
+    # Required for now...
+    message(FATAL_ERROR "nasm not found")
+endif()
+
+macro(BUILD_ROM name)
+    set(_optionArgs     CHECKSUM)
+    set(_oneValueArgs   "")
+    set(_multiValueArgs DEPENDS)
+    cmake_parse_arguments(_args "${_optionArgs}" "${_oneValueArgs}" "${_multiValueArgs}" ${ARGN})
+
+    set(_inName "${name}.asm")
+    set(_outName "${name}.bin")
+    set(_outFile "${CMAKE_CURRENT_BINARY_DIR}/${_outName}")
+    set(_csumCommand "")
+    set(_depends "")
+    if (${_args_CHECKSUM})
+        set(_csumCommand COMMAND rom_checksum ${_outFile})
+    endif()
+    if (DEFINED _args_DEPENDS)
+        set(_depends DEPENDS ${_args_DEPENDS})
+    endif()
+    add_custom_command(
+        OUTPUT ${_outName}
+        COMMAND ${NASM} -f bin -o ${_outFile} -l ${CMAKE_CURRENT_BINARY_DIR}/${name}.lst ${_inName}
+        ${_csumCommand}
+        MAIN_DEPENDENCY ${_inName}
+        ${_depends}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Building ${_outName}"
+        )
+    add_custom_target("${name}_rom" DEPENDS ${_outName})
+endmacro()
+
+add_subdirectory(utils)
+add_subdirectory(bios)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -60,8 +97,7 @@ set(OPCODE_TABLES
     opcodes_80386.cpp
     )
 
-add_executable(xemu
-    main.cpp
+add_library(xemu_core STATIC
     fileio.cpp fileio.h
     address.cpp address.h
     util.cpp util.h
@@ -73,11 +109,27 @@ add_executable(xemu
     cpu_flags.cpp cpu_flags.h
     cpu_registers.cpp cpu_registers.h
     system_bus.cpp system_bus.h
-    debugger.cpp debugger.h
-    ${GUI_SRC} gui.h
     gzstream.cpp gzstream.h
-    # Tests
-    test_moo.cpp
+    debugger.cpp debugger.h
+    # Automatically generated
+    opcode_types.cpp opcode_types.h
+    ${OPCODE_TABLES}
+    )
+
+target_link_libraries(xemu_core ${ZLIB_LIBRARY})
+target_include_directories(xemu_core PRIVATE ${ZLIB_INCLUDE_DIR})
+
+if (NOT MSVC)
+    set_source_files_properties(${OPCODE_TABLES} PROPERTIES COMPILE_FLAGS "-Wno-missing-field-initializers -Wno-missing-braces")
+endif()
+
+add_executable(xemu
+    main.cpp
+    ${GUI_SRC} gui.h
+    bios_replacement.cpp bios_replacement.h
+    keyboard.cpp keyboard.h
+    disk_format.cpp disk_format.h
+    disk_data.cpp disk_data.h
     # Devices
     devs/dma_handler.h
     devs/cga.cpp devs/cga.h devs/cga_font.h
@@ -85,14 +137,10 @@ add_executable(xemu
     devs/i8253_pit.cpp devs/i8253_pit.h
     devs/nec765_floppy_controller.cpp devs/nec765_floppy_controller.h
     devs/i8237a_dma_controller.cpp devs/i8237a_dma_controller.h
-    # Automatically generated
-    opcode_types.cpp opcode_types.h
-    ${OPCODE_TABLES}
+    devs/i8042_ps2_controller.cpp devs/i8042_ps2_controller.h
     )
 
-target_link_libraries(xemu ${ZLIB_LIBRARY})
-target_include_directories(xemu PRIVATE ${ZLIB_INCLUDE_DIR})
+target_link_libraries(xemu xemu_core)
+add_dependencies(xemu bios_rom videobios_rom)
 
-if (NOT MSVC)
-    set_source_files_properties(${OPCODE_TABLES} PROPERTIES COMPILE_FLAGS "-Wno-missing-field-initializers -Wno-missing-braces")
-endif()
+add_subdirectory(test)

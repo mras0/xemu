@@ -28,6 +28,8 @@ constexpr uint8_t SD_FLAGS_MASK_G = 1 << 3; // G: Granularity of limit (0 = byte
 constexpr uint16_t DESC_MASK_DPL = 3;
 constexpr uint16_t DESC_MASK_LOCAL = 4;
 
+static constexpr uint64_t DESCRIPTOR_MASK_PRESENT = 1ULL << 47;
+
 struct DescriptorTable {
     uint16_t limit;
     uint64_t base;
@@ -78,6 +80,11 @@ struct SegmentDescriptor {
     void setRealModeData(uint16_t value)
     {
         *this = fromU64(toRaw(0xffff, static_cast<uint64_t>(value) << 4, SD_ACCESS_MASK_S | SD_ACCESS_MASK_RW | SD_ACCESS_MASK_P, 0));
+    }
+
+    void setDpl(uint8_t newDpl)
+    {
+        access = (access & ~SD_ACCESS_MASK_DPL) | ((newDpl << SD_ACCESS_BIT_DPL) & SD_ACCESS_MASK_DPL);
     }
 
     static constexpr uint64_t toRaw(uint32_t limit, uint64_t base, uint8_t access, uint8_t flags)

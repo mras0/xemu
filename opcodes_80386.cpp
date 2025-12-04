@@ -535,8 +535,8 @@ const Instruction InstructionTable_80386[256] = {
 };
 
 static const Instruction ITable_0F_00[8] = {
-    { InstructionMnem::SLDT, { OperandMode::Mw } }, // 00/0
-    { InstructionMnem::STR, { OperandMode::Mw } }, // 00/1
+    { InstructionMnem::SLDT, { OperandMode::MwRv } }, // 00/0
+    { InstructionMnem::STR, { OperandMode::MwRv } }, // 00/1
     { InstructionMnem::LLDT, { OperandMode::Ew } }, // 00/2
     { InstructionMnem::LTR, { OperandMode::Ew } }, // 00/3
     { InstructionMnem::VERR, { OperandMode::Ew } }, // 00/4
@@ -550,7 +550,7 @@ static const Instruction ITable_0F_01[8] = {
     { InstructionMnem::SIDT, { OperandMode::Ms } }, // 01/1
     { InstructionMnem::LGDT, { OperandMode::Ms } }, // 01/2
     { InstructionMnem::LIDT, { OperandMode::Ms } }, // 01/3
-    { InstructionMnem::SMSW, { OperandMode::Mw } }, // 01/4
+    { InstructionMnem::SMSW, { OperandMode::MwRv } }, // 01/4
     { InstructionMnem::UNDEF }, // 01/5
     { InstructionMnem::LMSW, { OperandMode::Ew } }, // 01/6
     { InstructionMnem::UNDEF }, // 01/7

@@ -5,6 +5,13 @@
 #include <print>
 #include <cstring>
 
+//
+// LOADALL: https://www.rcollins.org/articles/loadall/
+//
+// TODO: on startup CS.base is set to 0xfffff000 (386)
+// TODO: PUSHF/POPF and VM flag
+// TODO: Writing through a protected mode code16 segment is probably not allowed
+
 constexpr uint32_t DEFAULT_EFLAGS_RESULT_MASK = EFLAGS_MASK_OF | EFLAGS_MASK_SF | EFLAGS_MASK_ZF | EFLAGS_MASK_AF | EFLAGS_MASK_PF | EFLAGS_MASK_CF;
 constexpr uint32_t VALID_CR_MASK = 1 << 0 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 8;
 
@@ -23,13 +30,13 @@ constexpr uint32_t VALID_CR_MASK = 1 << 0 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 8;
         throw CPUException{CPUExceptionNumber::InvalidOpcode}; \
     } while (false)
 
-#define THROW_GP(...) do { \
+#define THROW_GP(errorCode, ...) do { \
         assert(cpuModel_ >= CPUModel::i80286); \
         if (exceptionTraceMask_ & (1 << CPUExceptionNumber::GeneralProtection)) { \
             std::print("{}", IP_PREFIX()); \
             std::println(__VA_ARGS__); \
         } \
-        throw CPUException { CPUExceptionNumber::GeneralProtection }; \
+        throw CPUException { CPUExceptionNumber::GeneralProtection, errorCode }; \
     } while (false)
 
 static void SetFlag(uint32_t& flags, uint32_t mask, bool set)
@@ -55,6 +62,16 @@ std::string FormatCPUFlags(uint32_t flags)
     FB(C);
 #undef FB
     return res;
+}
+
+bool CPUState::vm86() const
+{
+    return (flags_ & EFLAGS_MASK_VM) != 0;
+}
+
+std::uint8_t CPUState::iopl() const
+{
+    return static_cast<uint8_t>((flags_ & EFLAGS_MASK_IOPL) >> EFLAGS_BIT_IOPL);
 }
 
 void ShowCPUState(const CPUState& state)
@@ -86,9 +103,19 @@ void ShowCPUState(const CPUState& state)
         std::print("{}={:04X} ", SRegText[r], state.sregs_[r]);
     }
     std::print("flags={} {}-bit", FormatCPUFlags(state.flags_), state.defaultOperandSize() * 8);
-    if (state.protectedMode())
-        std::print(" CPL={}", state.cpl());
+    if (state.protectedMode()) {
+        if (state.vm86())
+            std::print(" v86");
+        std::print(" CPL={} IOPL={}", state.cpl(), state.iopl());
+    }
     std::println("");
+
+#if 1
+    std::print("Prefetch queue: ");
+    for (auto pos = state.prefetch_.getPos; pos != state.prefetch_.putPos; ++pos)
+        std::print("{:02X}", state.prefetch_.peek(pos - state.prefetch_.getPos));
+    std::println("");
+#endif
 }
 
 template <>
@@ -195,17 +222,43 @@ static std::uint64_t AddReg(std::uint64_t& reg, std::int32_t addend, std::uint8_
     return res;
 }
 
+static std::uint8_t PrefixQueueLength(CPUModel model)
+{
+    switch (model) {
+    case CPUModel::i8088:
+        return 4;
+    case CPUModel::i8086:
+        return 6;
+    case CPUModel::i80386sx:
+        return 10; // Looks like it's 10 bytes
+    default: // i386 is documented as having a 16-byte queue, but it is actually 12 bytes (let's use that value for all processors > 80386)
+        return 12;
+    }
+}
+
+CPU::CPU(CPUModel cpuModel, SystemBus& bus)
+    : cpuModel_ { cpuModel }
+    , shiftMask_ { static_cast<uint8_t>(cpuModel <= CPUModel::i8086 ? 63 : 31) }
+    , prefetchQueueLength_ { PrefixQueueLength(cpuModel) }
+    , bus_ { bus }
+{
+    reset();
+}
+
 void CPU::reset()
 {
     std::memset(static_cast<CPUState*>(this), 0, sizeof(CPUState));
     currentInstruction = {};
     instructionsExecuted_ = 0;
+    controlTransferHistoryCount_ = 0;
     halted_ = false;
 
     setFlags(0);
     for (int sr = SREG_ES; sr <= SREG_GS; ++sr) {
-        if (sr != SREG_CS)
-            loadSreg(SReg(sr), 0);
+        if (sr != SREG_CS) {
+            sregs_[sr] = 0;
+            sdesc_[sr].setRealModeData(0);
+        }
     }
 
     if (cpuModel_ <= CPUModel::i8086) {
@@ -217,27 +270,20 @@ void CPU::reset()
         ip_ = 0xFFF0;
     }
 
-    if (cpuModel_ == CPUModel::i80386) {
+    if (cpuModel_ == CPUModel::i80386sx) {
         regs_[REG_DX] = 3 << 8 | 8; // Stepping in DL (8 = D1/D2)
     }
 
     idt_.base = 0;
     idt_.limit = 0x3ff;
+
+    prefetch_.flush(ip_);
 }
 
 CPUInfo CPU::cpuInfo() const
 {
     return CPUInfo { cpuModel_, defaultOperandSize() };
 }
-
-constexpr uint32_t PT32_MASK_P = 1 << 0; // Present
-constexpr uint32_t PT32_MASK_W = 1 << 1; // Writable
-constexpr uint32_t PT32_MASK_U = 1 << 2; // User accessible (otherwise only for supervisor)
-constexpr uint32_t PT32_MASK_A = 1 << 5; // Accessed
-constexpr uint32_t PT32_MASK_D = 1 << 6; // Dirty (not for PDE)
-
-constexpr uint32_t PDE32_MASK_PS = 1 << 7;
-constexpr uint32_t PT32_MASK_ADDR = 0xfffffc00; // Bit 31-12
 
 constexpr uint32_t PL_MASK_P = 1 << 0; // 1 if the fault was caused by a protection violation
 constexpr uint32_t PL_MASK_W = 1 << 1; // 1 if the access was a write
@@ -246,6 +292,60 @@ constexpr uint32_t PL_MASK_I = 1 << 3; // 1 for instruction fetches
 
 constexpr uint32_t PL_FLAG_MASK_ERRS = 15;
 constexpr uint32_t PL_FLAG_MASK_PEEK = 1 << 4;
+constexpr uint32_t PL_FLAG_MASK_SYS = 1 << 5;
+
+constexpr uint32_t TlbSetIndex(uint64_t linearAddress)
+{
+    return (linearAddress >> PT32_SHIFT) & (TLB::SetSize - 1);
+}
+
+std::string TlbEntryString(const TLBEntry& e)
+{
+    std::string flags;
+#define TLB_FLAG(x) flags += (e.value & TLB_MASK_##x) ? #x : "-";
+    TLB_FLAG(V);
+    TLB_FLAG(D);
+    TLB_FLAG(U);
+    TLB_FLAG(W);
+#undef TLB_FLAG
+    return std::format("TLBEntry(tag={:08X} value={:08X} {})", e.tag, e.value, flags);
+}
+
+bool TLBEntry::match(uint64_t linearAddress)
+{
+    return valid() && !((linearAddress ^ tag) & PT32_MASK_ADDR);
+}
+
+TLBEntry* TLB::find(uint64_t linearAddress)
+{
+    auto set = tlb[TlbSetIndex(linearAddress)];
+
+    for (uint32_t i = 0; i < SetWay; ++i) {
+        if (set[i].match(linearAddress))
+            return &set[i];
+    }
+
+    return nullptr;
+}
+
+TLBEntry* TLB::alloc(uint64_t linearAddress)
+{
+    auto set = tlb[TlbSetIndex(linearAddress)];
+    for (uint32_t i = 0; i < SetWay; ++i) {
+        if (!set[i].valid())
+            return &set[i];
+    }
+    // TODO: Use Tree-pLRU
+    // For now just use some "random" bits from the linearAddress
+    return &set[(linearAddress >> 4) & (TLB::SetWay - 1)];
+}
+
+void TLB::invalidate()
+{
+    for (uint32_t i = 0; i < SetSize; ++i)
+        for (uint32_t j = 0; j < SetWay; ++j)
+            tlb[i][j].value = 0;
+}
 
 std::string PageCommonText(uint32_t p)
 {
@@ -282,58 +382,77 @@ std::string PteText(uint32_t pte)
     return res;
 }
 
+#define PAGE_FAULT(...)                                                   \
+    do {                                                                  \
+        if (exceptionTraceMask_ & (1 << CPUExceptionNumber::PageFault)) { \
+            std::print("{}#PF {:08X} ", IP_PREFIX(), linearAddress);      \
+            std::println(__VA_ARGS__);                                    \
+        }                                                                 \
+        cregs_[2] = linearAddress;                                        \
+        throw CPUException { CPUExceptionNumber::PageFault, err };        \
+    } while (0)
+
 std::uint64_t CPU::pageLookup(std::uint64_t linearAddress, std::uint32_t lookupFlags)
 {
-    assert(!(lookupFlags & ~(PL_MASK_W | PL_MASK_I | PL_FLAG_MASK_PEEK)));
-    bool checkWrite = true;
+    assert(!(lookupFlags & ~(PL_MASK_W | PL_MASK_I | PL_FLAG_MASK_PEEK | PL_FLAG_MASK_SYS)));
+
+    bool checkWrite = (lookupFlags & PL_MASK_W) != 0;
     auto err = lookupFlags & PL_FLAG_MASK_ERRS;
-    if (cpl() == 3)
-        err |= PL_MASK_U;
-    else if (cpl() == 0 && !(cregs_[0] & CR0_MASK_WP))
-        checkWrite = false;
+    if (!(lookupFlags & PL_FLAG_MASK_SYS)) {
+        if (cpl() == 3)
+            err |= PL_MASK_U;
+        else if (cpl() == 0 && !(cregs_[0] & CR0_MASK_WP))
+            checkWrite = false;
+    }
+
+    TLBEntry* tlbEntry = nullptr;
+    if (!(lookupFlags & PL_FLAG_MASK_PEEK)) {
+        tlbEntry = tlb_.find(linearAddress);
+        if (tlbEntry) {
+            const auto tlbValue = tlbEntry->value;
+            assert(tlbValue & TLB_MASK_V);
+            if ((err & PL_MASK_U) && !(tlbValue & TLB_MASK_U)) {
+                err |= PL_MASK_P;
+                PAGE_FAULT("TLB access violation (user): {}", TlbEntryString(*tlbEntry));
+            }
+            if (checkWrite && !(tlbValue & TLB_MASK_W)) {
+                err |= PL_MASK_P;
+                PAGE_FAULT("TLB access violation (write): {}", TlbEntryString(*tlbEntry));
+            }
+            if (!(lookupFlags & PL_MASK_W) || (tlbValue & TLB_MASK_D))
+                return (tlbValue & PT32_MASK_ADDR) + (linearAddress & PAGE_MASK);
+            // Need to mark the entry as dirty
+        }
+    }
 
     const auto pdeAddr = cregs_[3] + ((linearAddress >> 22) & 1023) * 4;
     const auto pde = static_cast<uint32_t>(readMemPhysical(pdeAddr, 4));
-    if (!(pde & PT32_MASK_P)) {
-        std::print("LinearAddress {:08X} --> PDE not present: {}\n", linearAddress, PdeText(pde));
-    PageFault:
-        cregs_[2] = linearAddress;
-        throw CPUException { CPUExceptionNumber::PageFault, err };
-    }
+    if (!(pde & PT32_MASK_P))
+        PAGE_FAULT("PDE not present: {}", PdeText(pde));
 
     if (pde & PDE32_MASK_PS)
-        throw std::runtime_error { std::format("TODO: LinearAddress {:08X} --> {:08X} -- 4MB page", linearAddress, pde) };
+        throw std::runtime_error { std::format("{}TODO: LinearAddress {:08X} --> {:08X} -- 4MB page", IP_PREFIX(), linearAddress, pde) };
 
     // Only check permissions on PDE after checking if PTE is present
     const auto pteAddr = (pde & PT32_MASK_ADDR) + ((linearAddress >> 12) & 1023) * 4;
     const auto pte = static_cast<uint32_t>(readMemPhysical(pteAddr, 4));
-    if (!(pte & PT32_MASK_P)) {
-        std::print("LinearAddress {:08X} --> PTE not present: {}\n", linearAddress, PteText(pte));
-        goto PageFault;
-    }
+    if (!(pte & PT32_MASK_P))
+        PAGE_FAULT("PTE not present: {}", PteText(pte));
 
     // Mark as present in error code
     err |= PL_MASK_P;
 
-    if ((err & PL_MASK_U) && !(pde & PT32_MASK_U)) {
-        std::print("LinearAddress {:08X} --> PDE access violation (user): {}\n", linearAddress, PdeText(pde));
-        goto PageFault;
-    }
+    if ((err & PL_MASK_U) && !(pde & PT32_MASK_U))
+        PAGE_FAULT("PDE access violation (user): {}", PdeText(pde));
 
-    if (checkWrite && (lookupFlags & PL_MASK_W) && !(pde & PT32_MASK_W)) {
-        std::print("LinearAddress {:08X} --> PDE access violation (not writeable): {}\n", linearAddress, PdeText(pde));
-        goto PageFault;
-    }
+    if (checkWrite && !(pde & PT32_MASK_W))
+        PAGE_FAULT("PDE access violation (not writeable): {}", PdeText(pde));
 
-    if ((err & PL_MASK_U) && !(pte & PT32_MASK_U)) {
-        std::print("LinearAddress {:08X} --> PTE access violation (user): {}\n", linearAddress, PteText(pte));
-        goto PageFault;
-    }
+    if ((err & PL_MASK_U) && !(pte & PT32_MASK_U))
+        PAGE_FAULT("PTE access violation (user): {}", PteText(pte));
 
-    if (checkWrite && (lookupFlags & PL_MASK_W) && !(pte & PT32_MASK_W)) {
-        std::print("LinearAddress {:08X} --> PTE access violation (not writable): {}\n", linearAddress, PteText(pte));
-        goto PageFault;
-    }
+    if (checkWrite && !(pte & PT32_MASK_W))
+        PAGE_FAULT("PTE access violation (not writable): {}", PteText(pte));
 
     if (!(lookupFlags & PL_FLAG_MASK_PEEK)) {
         if (!(pde & PT32_MASK_A))
@@ -342,19 +461,134 @@ std::uint64_t CPU::pageLookup(std::uint64_t linearAddress, std::uint32_t lookupF
         const uint32_t fl = PT32_MASK_A | (lookupFlags & PL_MASK_W ? PT32_MASK_D : (pte & PT32_MASK_D));
         if ((pte & (PT32_MASK_A | PT32_MASK_D)) != fl)
             writeMemPhysical(pteAddr, pte | fl, 4);
+
+        if (!tlbEntry)
+            tlbEntry = tlb_.alloc(linearAddress);
+        tlbEntry->tag = linearAddress & PT32_MASK_ADDR;
+        tlbEntry->value = (pte & PT32_MASK_ADDR) | TLB_MASK_V;
+        if (pte & PT32_MASK_U)
+            tlbEntry->value |= TLB_MASK_U;
+        if (pte & PT32_MASK_W)
+            tlbEntry->value |= TLB_MASK_W;
+        if (fl & PT32_MASK_D)
+            tlbEntry->value |= TLB_MASK_D;
     }
 
-    return (pte & PT32_MASK_ADDR) + (linearAddress & 4095);
+    return (pte & PT32_MASK_ADDR) + (linearAddress & PAGE_MASK);
 }
 
-std::uint8_t CPU::readCodeByte(std::uint64_t offset, bool peek)
+void CPU::flushTLB()
+{
+    tlb_.invalidate();
+}
+
+bool CPU::instructionFetch(bool prefetch)
+{
+    auto& pf = prefetch_;
+    auto maxFetch = prefetchQueueLength_ - pf.size();
+    if (!maxFetch)
+        return false;
+
+    if (!(pf.ip & 3))
+        maxFetch = std::min(maxFetch, 4U);
+    else if (!(pf.ip & 1))
+        maxFetch = std::min(maxFetch, 2U);
+    else
+        maxFetch = 1;
+
+    switch (cpuModel_) {
+    case CPUModel::i8088:
+        maxFetch = 1;
+        break;
+    case CPUModel::i8086:
+        maxFetch = std::min(maxFetch, 2U);
+        //if (prefetch && maxFetch != 2)
+        //    return false;
+        break;
+    default: {
+        // Don't prefetch beyond limit
+        maxFetch = std::min(maxFetch, static_cast<uint32_t>(sdesc_[SREG_CS].limit + 1 - pf.ip));
+        if (!maxFetch) {
+            if (prefetch)
+                return false;
+            maxFetch = 1; // But do it if we have to
+        }
+        const uint32_t busLimit = cpuModel_ == CPUModel::i80386sx ? 2 : 4;
+        maxFetch = std::min(maxFetch, busLimit);
+        //if (prefetch && maxFetch != busLimit)
+        //    return false;
+    }
+    }
+
+    if (maxFetch >= 4)
+        maxFetch = 4;
+    else if (maxFetch >= 2)
+        maxFetch = 2;
+
+    const auto linearAddress = toLinearAddress(SegmentedAddress { SREG_CS, pf.ip }, static_cast<uint8_t>(maxFetch));
+
+    uint64_t physAddress;
+    if (pagingEnabled()) {
+        assert(!prefetch || !(((linearAddress ^ (linearAddress + maxFetch - 1)) & PT32_MASK_ADDR)));
+        physAddress = pageLookup(linearAddress, PL_MASK_I);
+    } else {
+        physAddress = linearAddress;
+    }
+
+    if (physAddress & 3) {
+        if (physAddress & 1)
+            maxFetch = 1;
+        else
+            maxFetch = std::min(maxFetch, 2U);
+    }
+
+    if (maxFetch == 1) {
+        pf.put(static_cast<uint8_t>(readMemPhysical(physAddress, 1)));
+    } else if (maxFetch == 2) {
+        assert(!(physAddress & 1));
+        const uint16_t word = static_cast<uint16_t>(readMemPhysical(physAddress, 2));
+        pf.put(word & 0xff);
+        pf.put((word >> 8) & 0xff);
+    } else {
+        assert(maxFetch == 4);
+        assert(!(physAddress & 3));
+        const uint32_t dword = static_cast<uint32_t>(readMemPhysical(physAddress, 4));
+        pf.put(dword & 0xff);
+        pf.put((dword >> 8) & 0xff);
+        pf.put((dword >> 16) & 0xff);
+        pf.put((dword >> 24) & 0xff);
+    }
+#if 0
+    std::string s;
+    for (uint32_t i = maxFetch; i--;)
+        s += HexString(&pf.data[(pf.putPos - i - 1) & (MaxPrefetchQueueLength - 1)], 1);
+    std::println("Fetched {} bytes from {:04X}:{:04X} ({:X}): {}", maxFetch, sregs_[SREG_CS], pf.ip, physAddress, s);
+#endif
+
+    pf.ip += maxFetch;
+    if (cpuModel_ <= CPUModel::i80186)
+        pf.ip &= 0xffff;
+
+    return true;
+}
+
+void CPU::instructionPrefetch()
+{
+    const uint32_t lowWaterMark = cpuModel_ >= CPUModel::i80386sx ? 4 : 1; // TODO: Figure out what it is for other processors
+    if (prefetch_.size() >= lowWaterMark)
+        return;
+    // Fill the queue
+    while (instructionFetch(true) && prefetch_.size() != prefetchQueueLength_)
+        ;
+}
+
+std::uint8_t CPU::peekCodeByte(std::uint64_t offset)
 {
     const auto addr = SegmentedAddress { SREG_CS, offset };
     uint64_t physAddress;
     if (pagingEnabled()) {
         try {
-            const auto flags = peek ? PL_FLAG_MASK_PEEK : PL_MASK_I;
-            physAddress = pageLookup(toLinearAddress(addr, 1), flags);
+            physAddress = pageLookup(toLinearAddress(addr, 1), PL_FLAG_MASK_PEEK);
         } catch (const CPUException& e) {
             assert(e.exceptionNo() == CPUExceptionNumber::PageFault);
             (void)e;
@@ -363,10 +597,7 @@ std::uint8_t CPU::readCodeByte(std::uint64_t offset, bool peek)
     } else {
         physAddress = toLinearAddress(addr, 1);
     }
-    if (peek)
-        return bus_.peekU8(physAddress);
-    else
-        return static_cast<uint8_t>(readMemPhysical(physAddress, 1));
+    return bus_.peekU8(physAddress);
 }
 
 std::uint64_t CPU::toLinearAddress(const SegmentedAddress& address, std::uint8_t accessSize) const
@@ -416,10 +647,10 @@ std::uint64_t CPU::readMemPhysical(std::uint64_t physicalAddress, std::uint8_t s
     return value;
 }
 
-std::uint64_t CPU::readMemLinear(std::uint64_t linearAddress, std::uint8_t size)
+std::uint64_t CPU::readMemLinear(std::uint64_t linearAddress, std::uint8_t size, uint32_t lookupFlags)
 {
     if (pagingEnabled())
-        return readMemPhysical(pageLookup(linearAddress, 0), size);
+        return readMemPhysical(pageLookup(linearAddress, lookupFlags), size);
     else
         return readMemPhysical(linearAddress, size);
 }
@@ -438,12 +669,10 @@ uint64_t CPU::verifyAddress(const SegmentedAddress& addr, uint8_t size, bool for
         }
     }
 
-    if (forWrite && protectedMode()) {
+    if (forWrite && protectedMode() && !vm86()) {
         const auto& desc = sdesc_[addr.sreg];
-        if ((desc.access & (SD_ACCESS_MASK_E | SD_ACCESS_MASK_RW)) != SD_ACCESS_MASK_RW) {
-            std::print("TODO: #GP fault for write to 0x{:04X}:0x{:08X} size {} through {} {}\n", sregs_[addr.sreg], addr.offset, size, SRegText[addr.sreg], desc);
-            throw CPUException { CPUExceptionNumber::GeneralProtection };
-        }
+        if ((desc.access & (SD_ACCESS_MASK_E | SD_ACCESS_MASK_RW)) != SD_ACCESS_MASK_RW)
+            THROW_GP(0, "#GP fault for write to 0x{:04X}:0x{:08X} size {} through {} {}", sregs_[addr.sreg], addr.offset, size, SRegText[addr.sreg], desc);
     }
 
     nextVa->physicalAddress = toPhysicalAddress(addr, size, forWrite ? PL_MASK_W : 0);
@@ -711,6 +940,8 @@ void CPU::writeEA(int index, std::uint64_t value)
         if (ea.regNum == 0 && (value & CR0_MASK_PG) && !(value & CR0_MASK_PE))
             throw std::runtime_error { "Cannot enable paging w/o PE" }; // Should be a GPE
         cregs_[ea.regNum] = value;
+        if (ea.regNum == 3)
+            flushTLB();
         break;
     case DecodedEAType::rm16:
     case DecodedEAType::rm32:
@@ -726,7 +957,7 @@ void CPU::writeEA(int index, std::uint64_t value)
 void CPU::setFlags(std::uint32_t value)
 {
     flags_ = value;
-    if (cpuModel_ < CPUModel::i80386) {
+    if (cpuModel_ < CPUModel::i80386sx) {
         flags_ &= 0xffff - 0x28;
         flags_ |= 0xf002;
     } else {
@@ -734,6 +965,20 @@ void CPU::setFlags(std::uint32_t value)
         flags_ &= ~(1 << 3 | 1 << 5 | 1 << 15);
         //flags_ &= ~0x3FC08028;
     }
+}
+
+uint32_t CPU::filterFlags(std::uint32_t flags, bool op16bit)
+{
+    // TODO: Flags need to be filtered (more)
+    uint32_t keepFlagsMask = 0;
+
+    if (op16bit)
+        keepFlagsMask |= 0xffff0000;
+
+    if (vm86())
+        keepFlagsMask |= EFLAGS_MASK_IOPL;
+
+    return (flags_ & keepFlagsMask) | (flags & ~keepFlagsMask);
 }
 
 void CPU::updateFlags(std::uint64_t value, std::uint64_t carry, std::uint32_t flagsMask)
@@ -797,6 +1042,8 @@ void CPU::updateSp(std::int32_t itemCount)
 
 void CPU::push(std::uint64_t value, std::uint8_t size)
 {
+    if (size == 0)
+        size = defaultOperandSize();
     assert(size == 2 || size == 4);
     AddReg(regs_[REG_SP], -size, stackSize());
     writeMem(currentSp(), value, size);
@@ -804,6 +1051,8 @@ void CPU::push(std::uint64_t value, std::uint8_t size)
 
 std::uint64_t CPU::pop(std::uint8_t size)
 {
+    if (size == 0)
+        size = defaultOperandSize();
     assert(size == 2 || size == 4);
     const auto res = readMem(currentSp(), size);
     AddReg(regs_[REG_SP], size, stackSize());
@@ -821,7 +1070,7 @@ void CPU::showState(const CPUState& state, const uint8_t* instructionBytes)
             if (instructionBytes)
                 return instructionBytes[offset++];
             else
-                return readCodeByte(state.ip_ + (offset++), true);
+                return peekCodeByte(state.ip_ + (offset++));
         };
         const auto res = Decode(CPUInfo { cpuModel_, state.defaultOperandSize() }, fetch);
         std::print("{}\n", FormatDecodedInstructionFull(res, pc));
@@ -900,6 +1149,7 @@ void CPU::step()
         } catch (...) {
             // Move back....
             ip_ = currentIp_;
+            prefetch_.flush(ip_);
             memcpy(history.instructionBytes, currentInstruction.instructionBytes, currentInstruction.numInstructionBytes);
             throw;
         }
@@ -913,12 +1163,18 @@ void CPU::step()
             if (cpuModel_ == CPUModel::i8088) {
                 // On the 8088 specifically, the return address pushed to the stack on divide exception is the address of the next instruction. (From SingleStepTests)
                 ip_ = (ip_ + currentInstruction.numInstructionBytes) & 0xffff;
+                prefetch_.flush(ip_);
             }
         }
         doInterrupt(exceptionNo, true);
         if (e.hasErrorCode() && protectedMode())
             push(e.errorCode(), 4);
     }
+}
+
+void CPU::changeCpl(uint8_t newCpl)
+{
+    sdesc_[SREG_CS].setDpl(newCpl);
 }
 
 constexpr uint32_t TSS32_ESP0_OFFSET = 0x04;
@@ -944,10 +1200,11 @@ void CPU::tssSaveStack()
     throw std::runtime_error { std::format("TODO: tssSaveStack with cpl={} tssAddr=0x{:X}", cpl(), tssAddr) };
 }
 
-void CPU::tssRestoreStack(std::uint8_t newCpl)
+void CPU::tssRestoreStack(std::uint8_t newCpl, bool fromVM86)
 {
     if (newCpl != 0)
         throw std::runtime_error { std::format("TODO: tssRestoreStack with newCpl={}", newCpl) };
+    const auto opSize = static_cast<uint8_t>(protectedMode() ? 4 : 2);
     const auto tssAddr = tssAddress(TSS32_SS0_OFFSET + 2);
     const auto ss = static_cast<uint16_t>(readMemLinear(tssAddr + TSS32_SS0_OFFSET, 2));
     const auto sp = static_cast<uint32_t>(readMemLinear(tssAddr + TSS32_ESP0_OFFSET, 4));
@@ -955,11 +1212,20 @@ void CPU::tssRestoreStack(std::uint8_t newCpl)
     const auto oldSS = sregs_[SREG_SS];
     const auto oldSP = regs_[REG_SP];
     // Lower CPL now (to avoid #GP when restoring SS)
-    sregs_[SREG_CS] = (sregs_[SREG_CS] & ~DESC_MASK_DPL) | newCpl;
+    changeCpl(newCpl);
     loadSreg(SREG_SS, ss);
     regs_[REG_SP] = sp;
-    push(oldSS, currentInstruction.operandSize);
-    push(oldSP, currentInstruction.operandSize);
+
+    if (fromVM86) {
+        assert(protectedMode());
+        push(sregs_[SREG_GS], opSize);
+        push(sregs_[SREG_FS], opSize);
+        push(sregs_[SREG_DS], opSize);
+        push(sregs_[SREG_ES], opSize);
+    }
+
+    push(oldSS, opSize);
+    push(oldSP, opSize);
 }
 
 
@@ -968,7 +1234,8 @@ SegmentDescriptor CPU::readDescriptor(std::uint16_t value)
     uint64_t base;
     uint16_t limit;
     if (value & 4) {
-        assert((ldt_.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) == (SD_ACCESS_MASK_P | SD_TYPE_LDT));
+        if ((ldt_.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) != (SD_ACCESS_MASK_P | SD_TYPE_LDT))
+            throw std::runtime_error { std::format("{} Invalid local descriptor {:04X} ldt={}", IP_PREFIX(), value, ldt_)};
         base = ldt_.base;
         assert(ldt_.limit <= 0xffff);
         limit = static_cast<uint16_t>(ldt_.limit);
@@ -977,9 +1244,25 @@ SegmentDescriptor CPU::readDescriptor(std::uint16_t value)
         limit = gdt_.limit;
     }
     const auto ofs = static_cast<uint32_t>(value & ~7);
-    if (ofs + 8 > limit)
-        throw CPUException { CPUExceptionNumber::GeneralProtection, static_cast<uint32_t>(value & ~DESC_MASK_DPL) };
-    return SegmentDescriptor::fromU64(readMemLinear(base + ofs, 8));
+    if (ofs + 7 > limit)
+        THROW_GP(static_cast<uint32_t>(value & ~DESC_MASK_DPL), "Descritor {:04X} outside {} limit ({:04X})", value, value & 4 ? "LDT" : "GDT", limit);
+    return SegmentDescriptor::fromU64(readMemLinear(base + ofs, 8, PL_FLAG_MASK_SYS));
+}
+
+void CPU::recordControlTransfer()
+{
+    controlTransferHistory_[controlTransferHistoryCount_++ % maxControlTransferHistory] = Address { sregs_[SREG_CS], currentIp_, defaultOperandSize() };
+}
+
+void CPU::showControlTransferHistory(size_t max)
+{
+    if (max > controlTransferHistoryCount_)
+        max = controlTransferHistoryCount_;
+
+    for (size_t i = controlTransferHistoryCount_ - max; i < controlTransferHistoryCount_; ++i) {
+        const auto& history = controlTransferHistory_[i % maxControlTransferHistory];
+        std::println("{}", history);
+    }
 }
 
 void CPU::loadSreg(SReg sr, std::uint16_t value)
@@ -988,44 +1271,48 @@ void CPU::loadSreg(SReg sr, std::uint16_t value)
         if (protectedMode())
             throw std::runtime_error { std::format("Setting CS to {:04X} in protected mode with loadSreg", value) };
         sdesc_[SREG_CS].setRealModeCode(value);
+    } else if (vm86()) {
+        sdesc_[sr].setRealModeData(value);
     } else if (protectedMode()) {
         const auto rpl = value & DESC_MASK_DPL;
         const std::uint16_t selector = value & ~DESC_MASK_DPL;
         SegmentDescriptor desc = readDescriptor(value);
         const auto dpl = desc.dpl();
         if (sr == SREG_SS) {
-            // segment selector is NULL
+            // 
             if (!value)
-                throw CPUException { CPUExceptionNumber::GeneralProtection, 0 };
+                THROW_GP(0, "SS: Segment selector is NULL");
             // segment selector's RPL != CPL
             // segment is not a writable data segment
             // DPL != CPL
             if (rpl != dpl || (desc.access & (SD_ACCESS_MASK_E | SD_ACCESS_MASK_RW)) != SD_ACCESS_MASK_RW || dpl != cpl())
-                throw CPUException { CPUExceptionNumber::GeneralProtection, selector };
+                THROW_GP(selector, "SS: Invalid segment descriptor");
             // segment not marked present
             if (!desc.present())
                 throw CPUException { CPUExceptionNumber::StackSegmentFault, selector };
         } else if (value) {
-            // segment is not a data or readable code segment
             if (!(desc.access & SD_ACCESS_MASK_S) || ((desc.access & SD_ACCESS_MASK_E) && !(desc.access & SD_ACCESS_MASK_RW)))
-                throw CPUException { CPUExceptionNumber::GeneralProtection, selector };
-            // (segment is a data or nonconforming code segment) AND ((RPL > DPL) or (CPL > DPL))
+                THROW_GP(selector, "Segment is not a data or readable code segment");
             if ( (!(desc.access & SD_ACCESS_MASK_E) || (desc.access & (SD_ACCESS_MASK_E | SD_ACCESS_MASK_DC)) == (SD_ACCESS_MASK_E | SD_ACCESS_MASK_DC)) &&
                 (rpl > dpl || cpl() > dpl))
-                throw CPUException { CPUExceptionNumber::GeneralProtection, selector };
+                THROW_GP(selector, "Segment is a data or nonconforming code segment) AND ((RPL > DPL) or (CPL > DPL)");
             if (!desc.present())
                 throw CPUException { CPUExceptionNumber::SegmentNotPresent, selector };
         }
         //std::print("{} loaded with 0x{:04x} {}\n", SRegText[sr], value, desc);
         sdesc_[sr] = desc;
     } else {
-        sdesc_[sr].setRealModeData(value);
+        // Only base is updated! Not limit.
+        // https://www.os2museum.com/wp/a-brief-history-of-unreal-mode/
+        sdesc_[sr].base = static_cast<uint64_t>(value) << 4;
     }
     sregs_[sr] = value;
 }
 
 void CPU::doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferType type)
 {
+    recordControlTransfer();
+
     const char* const typeNames[] = { "jump", "call", "interrupt" };
     static_assert(std::size(typeNames) == static_cast<size_t>(ControlTransferType::max));
     const char* const typeName = typeNames[static_cast<size_t>(type)];
@@ -1053,12 +1340,21 @@ void CPU::doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferT
     if (type == ControlTransferType::interrupt)
         flags_ &= ~EFLAGS_MASK_IF;
 
-    if (!protectedMode()) {
+    if (!protectedMode() || (vm86() && type != ControlTransferType::interrupt)) {
         saveRegs();
         sregs_[SREG_CS] = cs;
         sdesc_[SREG_CS].setRealModeCode(cs);
+        if (vm86())
+            sdesc_[SREG_CS].setDpl(3);
         ip_ = ip & ipMask();
+        prefetch_.flush(ip_);
         return;
+    }
+
+    bool fromVM86 = false;
+    if (vm86()) {
+        fromVM86 = true;
+        flags_ &= ~EFLAGS_MASK_VM;
     }
 
     SegmentDescriptor desc = readDescriptor(cs);
@@ -1066,20 +1362,22 @@ void CPU::doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferT
         throw std::runtime_error { "TODO: Code segment not present (raise #NP)" };
 
     if (desc.access & SD_ACCESS_MASK_S) {
-        if (!(desc.access & SD_ACCESS_MASK_E) || !(desc.flags & SD_FLAGS_MASK_DB))
+        if (!(desc.access & SD_ACCESS_MASK_E))
             throw std::runtime_error { std::format("TODO: CS loaded with unsupported descriptor {}", desc) };
 
         if (type == ControlTransferType::interrupt) {
             const auto newCpl = desc.dpl();
             if (newCpl < cpl()) {
                 //std::print("INT: Stack switch CPL {} -> {}\n", cpl(), newCpl);
-                tssRestoreStack(newCpl); // Lowers CPL and pushes SS:ESP
+                tssRestoreStack(newCpl, fromVM86); // Lowers CPL and pushes SS:ESP
             } else {
                 //std::print("INT: CPL {} -> {}\n", cpl(), newCpl);
                 cs = (cs & ~DESC_MASK_DPL) | newCpl;
             }
         }
     } else {
+        assert(!fromVM86);
+
         if ((desc.access & SD_ACCESS_MASK_TYPE) != SD_TYPE_CALL32)
             throw std::runtime_error { std::format("TODO: CS loaded with unsupported descriptor {}", desc) };
 
@@ -1099,7 +1397,7 @@ void CPU::doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferT
         const auto newCpl = static_cast<uint8_t>(desc.call32.selector & DESC_MASK_DPL);
         if (newCpl < cpl()) {
             //std::print("Switching stack on call gate transition from {} to {}\n", cpl(), newCpl);
-            tssRestoreStack(newCpl); // Also pushes SS:ESP
+            tssRestoreStack(newCpl, false); // Also pushes SS:ESP
         }
 
         //std::print("Using call descriptor:\n{}\n{}\n", desc, codeDesc);
@@ -1113,10 +1411,13 @@ void CPU::doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferT
     sregs_[SREG_CS] = cs;
     sdesc_[SREG_CS] = desc;
     ip_ = ip & ipMask();
+    prefetch_.flush(ip_);
 }
 
 void CPU::doNearControlTransfer(ControlTransferType type)
 {
+    recordControlTransfer();
+
     assert(type == ControlTransferType::jump || type == ControlTransferType::call);
     const auto oldIp = ip_;
     const auto& ea = currentInstruction.ea[0];
@@ -1130,58 +1431,49 @@ void CPU::doNearControlTransfer(ControlTransferType type)
     else
         ip_ = readEA(0);
     ip_ &= ipMask();
+    prefetch_.flush(ip_);
     if (type == ControlTransferType::call)
         push(oldIp, currentInstruction.operandSize);
 }
 
-void CPU::doFarJump(std::uint16_t cs, std::uint64_t ip)
-{
-    if (protectedMode()) {
-        SegmentDescriptor desc = readDescriptor(cs);
-
-        if (!desc.present())
-            throw std::runtime_error { "TODO: Code segment not present (raise #NP)" };
-
-        if (desc.access & SD_ACCESS_MASK_S) {
-            if (!(desc.access & SD_ACCESS_MASK_E) || !(desc.flags & SD_FLAGS_MASK_DB))
-                throw std::runtime_error { std::format("TODO: CS loaded with unsupported descriptor {}", desc) };
-        } else {
-            // Should have gone through doControlTransfer
-            throw std::runtime_error { std::format("TODO: doFarJmp, CS loaded with unsupported descriptor {}", desc) };
-        }
-
-        sdesc_[SREG_CS] = desc;
-    } else {
-        sdesc_[SREG_CS].setRealModeCode(cs);
-    }
-    sregs_[SREG_CS] = cs;
-    ip_ = ip & ipMask();
-}
-
 void CPU::doInterruptReturn()
 {
+    recordControlTransfer();
+
     const auto ip = readStack(0);
     const auto cs = static_cast<uint16_t>(readStack(1));
-    auto flags = static_cast<uint32_t>(readStack(2));
+    const auto flags = filterFlags(static_cast<uint32_t>(readStack(2)), currentInstruction.operandSize == 2);
     if (cpuModel_ >= CPUModel::i80286 && ip > sdesc_[SREG_CS].limit)
-        THROW_GP("RETN -  return instruction pointer is not within the return code segment limit");
+        THROW_GP(0, "IRET - return instruction pointer is not within the return code segment limit");
     updateSp(3);
 
-    // TODO: Flags need to be filtered
-
-    if (currentInstruction.operandSize == 2)
-        flags |= flags_ & 0xffff0000;
-
-    if (!protectedMode()) {
+    if (!protectedMode() || vm86()) { // Privilege level already checked
         setFlags(flags);
-        doFarJump(cs, ip);
+        doControlTransfer(cs, ip, ControlTransferType::jump);
         return;
     }
 
     // TODO: Probably need to check CS/SS descriptors before changing registers to allow recovery
 
+    if (flags & EFLAGS_MASK_NT)
+        throw std::runtime_error { std::format("TODO: IRET with nested task") };
+
+    uint8_t requestedPL = static_cast<uint8_t>(cs & DESC_MASK_DPL);
+
+    if (flags & EFLAGS_MASK_VM) {
+        // RETURN-TO-VIRTUAL-8086-MODE (if cpl() == 0)
+
+        if (cpl() != 0)
+            throw std::runtime_error { "TODO: IRET with VM=1 and cpl() = " + std::to_string(cpl()) };
+
+        // TODO:
+        // IF EIP is not within CS limit THEN #GP(0); FI;
+        setFlags(flags);
+        requestedPL = 3;
+    }
+
     // PROTECTED-MODE-RETURN:
-    if ((cs & DESC_MASK_DPL) > cpl()) {
+    if (requestedPL > cpl()) {
         // RETURN-TO-OUTER-PRIVILEGE-LEVEL
 
         //std::print("IRET: Stack switch on {} -> {} transition\n", cpl(), (cs & DESC_MASK_DPL));
@@ -1189,10 +1481,25 @@ void CPU::doInterruptReturn()
         // pop before changing privilege level
         const auto sp = pop(currentInstruction.operandSize);
         const auto ss = static_cast<uint16_t>(pop(currentInstruction.operandSize));
-        doFarJump(cs, ip);
+        if (vm86()) {
+            loadSreg(SREG_ES, static_cast<uint16_t>(pop()));
+            loadSreg(SREG_DS, static_cast<uint16_t>(pop()));
+            loadSreg(SREG_FS, static_cast<uint16_t>(pop()));
+            loadSreg(SREG_GS, static_cast<uint16_t>(pop()));
+            sdesc_[SREG_CS].setRealModeCode(cs);
+            sdesc_[SREG_CS].setDpl(requestedPL);
+            sregs_[SREG_CS] = cs;
+            ip_ = ip;
+            prefetch_.flush(ip_);
+        } else {
+            setFlags(flags);
+            doControlTransfer(cs, ip, ControlTransferType::jump);
+        }
         regs_[REG_SP] = sp;
         loadSreg(SREG_SS, ss);
-        setFlags(flags);
+
+        if (vm86())
+            return;
 
         for (const auto sr : { SREG_ES, SREG_DS, SREG_FS, SREG_GS }) {
             auto& desc = sdesc_[sr];
@@ -1204,8 +1511,8 @@ void CPU::doInterruptReturn()
         }
     } else {
         // RETURN-TO-SAME-PRIVILEGE-LEVEL
-        doFarJump(cs, ip);
         setFlags(flags);
+        doControlTransfer(cs, ip, ControlTransferType::jump);
     }
 }
 
@@ -1214,11 +1521,9 @@ void CPU::doInterrupt(std::uint8_t interruptNo, bool hardwareInterrupt)
     history_[(instructionsExecuted_ - 1) % MaxHistory].exception = interruptNo | (hardwareInterrupt ? ExceptionHardwareMask : 0);
 
     if (protectedMode()) {
-        if (interruptNo * 8 > idt_.limit) {
-            std::print("Interrupt {} over limit {}\n", interruptNo, idt_.limit);
-            throw CPUException { CPUExceptionNumber::GeneralProtection };
-        }
-        const auto desc = readMemLinear(idt_.base + 8 * interruptNo, 8);
+        if (interruptNo * 8 - 1> idt_.limit)
+            THROW_GP(0, "Interrupt {} over limit {}", interruptNo, idt_.limit);
+        const auto desc = readMemLinear(idt_.base + 8 * interruptNo, 8, PL_FLAG_MASK_SYS);
         const auto offset = (desc & 0xffff) | ((desc >> 48) << 16);
         const auto selector = static_cast<uint16_t>((desc >> 16) & 0xffff);
         const auto flags = (desc >> 40) & 0xff;
@@ -1236,10 +1541,8 @@ void CPU::doInterrupt(std::uint8_t interruptNo, bool hardwareInterrupt)
 
         doControlTransfer(selector, offset, ControlTransferType::interrupt);
     } else {
-        if (interruptNo * 4 > idt_.limit) {
-            std::print("Interrupt {} over limit {}\n", interruptNo, idt_.limit);
-            throw CPUException { CPUExceptionNumber::GeneralProtection };
-        }
+        if (interruptNo * 4 - 1 > idt_.limit)
+            THROW_GP(0, "Interrupt {} over limit {}", interruptNo, idt_.limit);
         const auto addr = readMemPhysical(static_cast<uint64_t>(interruptNo) << 2, 4);
         doControlTransfer(static_cast<uint16_t>(addr >> 16), addr & 0xffff, ControlTransferType::interrupt);
     }
@@ -1411,7 +1714,14 @@ void CPU::checkPriv(std::uint32_t errorCode)
 {
     if (!protectedMode() || cpl() == 0)
         return;
-    throw CPUException { CPUExceptionNumber::GeneralProtection, errorCode };
+    THROW_GP(errorCode, "{} not permitted cpl {}", currentInstruction.mnemoic, cpl());
+}
+
+void CPU::checkPrivVM86()
+{
+    if (!vm86() || iopl() == 3)
+        return;
+    THROW_GP(0, "{} not permitted in V86 mode with iopl {}", currentInstruction.mnemoic, iopl());
 }
 
 struct IMulResult {
@@ -1469,15 +1779,22 @@ static std::uint64_t GetDoubleReg(const CPUState& state, std::uint8_t halfSize)
 
 void CPU::doStep()
 {
-    int64_t offset = 0;
-    currentInstruction = Decode(cpuInfo(), [&]() { return readCodeByte(ip_ + (offset++), false); });
+    instructionPrefetch();
+
+    currentInstruction = Decode(cpuInfo(), [&]() {
+        if (!prefetch_.empty())
+            return prefetch_.get();
+        instructionFetch(false);
+        assert(!prefetch_.empty());
+        return prefetch_.get();
+    });
     const auto& ins = currentInstruction;
 
     ip_ += ins.numInstructionBytes;
-    if (cpuModel_ < CPUModel::i80386)
+    if (cpuModel_ < CPUModel::i80386sx)
         ip_ &= 0xffff;
 
-    if ((ins.prefixes & PREFIX_LOCK) && cpuModel_ >= CPUModel::i80386) {
+    if ((ins.prefixes & PREFIX_LOCK) && cpuModel_ >= CPUModel::i80386sx) {
         //The LOCK prefix can be prepended only to the following instructions and only to those forms of the instructions where the destination operand is a memory operand:
         // ADD, ADC, AND, BTC, BTR, BTS, CMPXCHG, CMPXCH8B, CMPXCHG16B, DEC, INC, NEG, NOT, OR, SBB, SUB, XOR, XADD, and XCHG
         switch (ins.instruction->mnemonic) {
@@ -1518,7 +1835,7 @@ LockException:
     case InstructionMnem::AAA:
         // TODO: OF/SF/ZF/PF
         if ((regs_[REG_AX] & 0xf) > 9 || (flags_ & EFLAGS_MASK_AF)) {
-            if (cpuModel_ < CPUModel::i80386) {
+            if (cpuModel_ < CPUModel::i80386sx) {
                 UpdateU8L(regs_[REG_AX], (regs_[REG_AX] + 6) & 0xf); // AL = (AL + 6) & 0xf
                 UpdateU8H(regs_[REG_AX], (regs_[REG_AX] >> 8) + 1);  // AH += 1
             } else {
@@ -1554,7 +1871,7 @@ LockException:
     case InstructionMnem::AAS:
         // TODO: OF/SF/ZF/PF
         if ((regs_[REG_AX] & 0xf) > 9 || (flags_ & EFLAGS_MASK_AF)) {
-            if (cpuModel_ < CPUModel::i80386) {
+            if (cpuModel_ < CPUModel::i80386sx) {
                 UpdateU8L(regs_[REG_AX], (regs_[REG_AX] - 6) & 0xf); // AL = (AL - 6) & 0xf
                 UpdateU8H(regs_[REG_AX], (regs_[REG_AX] >> 8) - 1); // AH -= 1
             } else {
@@ -1693,7 +2010,10 @@ LockException:
         flags_ &= ~EFLAGS_MASK_DF;
         break;
     case InstructionMnem::CLI:
-        checkPriv(0);
+        if (vm86())
+            checkPrivVM86();
+        else
+            checkPriv(0);
         flags_ &= ~EFLAGS_MASK_IF;
         break;
     case InstructionMnem::CMC:
@@ -1722,7 +2042,7 @@ LockException:
         if ((old_AL & 0xf) > 9 || (flags_ & EFLAGS_MASK_AF)) {
             AddReg(regs_[REG_AX], adjust, 1);
             flags_ |= EFLAGS_MASK_AF;
-            if (cpuModel_ >= CPUModel::i80386 && adjust < 0 && (old_AL - 6) < 0)
+            if (cpuModel_ >= CPUModel::i80386sx && adjust < 0 && (old_AL - 6) < 0)
                 flags_ |= EFLAGS_MASK_CF;
         }
         if (old_AL > upperCheck || old_CF) {
@@ -1804,6 +2124,7 @@ LockException:
         flagsMask = DEFAULT_EFLAGS_RESULT_MASK & ~EFLAGS_MASK_CF; // Carry not updated
         break;
     case InstructionMnem::INT:
+        checkPrivVM86();
         doInterrupt(static_cast<uint8_t>(ins.ea[0].immediate), false);
         break;
     case InstructionMnem::INT3:
@@ -1893,7 +2214,7 @@ LockException:
 
         // N.B. 8088/8006 does not allow INTx_MIN!
         if (ins.operandSize == 1) {
-            if (cpuModel_ == CPUModel::i80386 && q < INT8_MIN) {
+            if (cpuModel_ == CPUModel::i80386sx && q < INT8_MIN) {
                 // Very weird behavior seen in 386 SingleStepTests. Obviously this isn't what actually happens in the CPU, but it matches.
                 q = static_cast<int64_t>(l ^ 0x4000) / static_cast<int64_t>(r);
                 rem = static_cast<int64_t>(l ^ 0x4000) % static_cast<int64_t>(r);
@@ -2013,6 +2334,11 @@ LockException:
     case InstructionMnem::LLDT: {
         const auto index = static_cast<uint16_t>(readEA(0));
         assert(!(index & 7));
+        if ((index & ~3) == 0) {
+            std::println("Invalid LDT loaded: {:04X}", index);
+            ldt_ = SegmentDescriptor {};
+            break;
+        }
         const auto desc = readDescriptor(index);
         if ((desc.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) != (SD_ACCESS_MASK_P | SD_TYPE_LDT))
             throw std::runtime_error { std::format("Invalid LDT descriptor {}", desc) };
@@ -2026,6 +2352,7 @@ LockException:
         if ((desc.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) != (SD_ACCESS_MASK_P | SD_TYPE_TASK32_AVAILABLE))
             throw std::runtime_error { std::format("Invalid TASK descriptor {}", desc) };
         task_ = desc;
+        taskIndex_ = index;
         break;
     }
     case InstructionMnem::LDS:
@@ -2154,11 +2481,9 @@ DoLoop:
         break;
     }
     case InstructionMnem::POPF:
+        checkPrivVM86();
         assert(ins.operandSize == 2 || ins.operandSize == 4);
-        if (ins.operandSize == 2)
-            setFlags((flags_ & 0xffff0000) | static_cast<uint32_t>(pop(2)));
-        else
-            setFlags(static_cast<uint32_t>(pop(4)));
+        setFlags(filterFlags(static_cast<uint32_t>(pop(ins.operandSize)), ins.operandSize == 2));
         break;
     case InstructionMnem::PUSHA:
         for (int reg = REG_DI; reg >= REG_AX; reg--)
@@ -2167,18 +2492,25 @@ DoLoop:
         break;
     case InstructionMnem::PUSHF:
         // ?? At least for i386 it seems like the upper bits read as zero
+        checkPrivVM86();
         push(flags_ & 0xffff, ins.operandSize);
         break;
     case InstructionMnem::IRET:
+        checkPrivVM86();
         doInterruptReturn();
         break;
     case InstructionMnem::RETF: {
         const auto ip = readStack(0);
         const auto cs = static_cast<uint16_t>(readStack(1));
-        if (cpuModel_ >= CPUModel::i80286 && ip > sdesc_[SREG_CS].limit)
-            THROW_GP("RETN -  return instruction pointer is not within the return code segment limit");
+        if (cpuModel_ >= CPUModel::i80286) {
+            auto limit = sdesc_[SREG_CS].limit;
+            if (protectedMode() && !vm86()) 
+                limit = readDescriptor(cs).limit; // Need to check with the descriptor that's about to be loaded
+            if (ip > limit)
+                THROW_GP(0, "RETF - return instruction pointer is not within the return code segment limit {:X} > {:X}", ip, limit);
+        }
         updateSp(2);
-        doFarJump(cs, ip);
+        doControlTransfer(cs, ip, ControlTransferType::jump);
         if (currentInstruction.numOperands)
             AddReg(regs_[REG_SP], static_cast<uint32_t>(readEA(0)), stackSize());
         break;
@@ -2186,16 +2518,17 @@ DoLoop:
     case InstructionMnem::RETN: {
         auto retAddress = readStack(0);
         if (cpuModel_ >= CPUModel::i80286 && retAddress > sdesc_[SREG_CS].limit)
-            THROW_GP("RETN -  return instruction pointer is not within the return code segment limit");
+            THROW_GP(0, "RETN -  return instruction pointer is not within the return code segment limit");
         updateSp(1);
         if (currentInstruction.numOperands) {
             auto tempSp = regs_[REG_SP];
             AddReg(tempSp, static_cast<uint32_t>(readEA(0)), stackSize());
             if (cpuModel_ >= CPUModel::i80286 && tempSp > sdesc_[SREG_SS].limit)
-                THROW_GP("RETN -  statkc pointer is not within limit");
+                THROW_GP(0, "RETN -  statkc pointer is not within limit");
             regs_[REG_SP] = tempSp;
         }
         Update(ip_, retAddress, currentInstruction.operandSize);
+        prefetch_.flush(ip_);
         break;
     }
     case InstructionMnem::SALC:
@@ -2243,7 +2576,7 @@ DoLoop:
             flagsMask = DEFAULT_EFLAGS_RESULT_MASK & ~EFLAGS_MASK_OF;
 
             // CF is undefined if count > size
-            if (ins.operationSize == 1 && cpuModel_ == CPUModel::i80386 && r > 8) {
+            if (ins.operationSize == 1 && cpuModel_ == CPUModel::i80386sx && r > 8) {
                 if ((r == 16 || r == 24) && (l & 1))
                     flags_ |= EFLAGS_MASK_CF | EFLAGS_MASK_OF;
                 else
@@ -2300,7 +2633,7 @@ DoLoop:
             // Update flags before writing back result
             updateFlags(result, carry, DEFAULT_EFLAGS_RESULT_MASK & ~(EFLAGS_MASK_OF | EFLAGS_MASK_CF | EFLAGS_MASK_AF));
             // result is undefined if count > size
-            if (ins.operationSize == 1 && cpuModel_ == CPUModel::i80386 && r > 8) {
+            if (ins.operationSize == 1 && cpuModel_ == CPUModel::i80386sx && r > 8) {
                 flags_ &= ~EFLAGS_MASK_OF; // Always cleared
                 if ((r == 16 || r == 24) && (l & 0x80))
                     flags_ |= EFLAGS_MASK_CF;
@@ -2417,6 +2750,13 @@ DoLoop:
         HANDLE_SUB_CARRY();
         flagsMask = DEFAULT_EFLAGS_RESULT_MASK;
         break;
+    case InstructionMnem::SGDT: {
+        auto addr = calcAddress(ins.ea[0]);
+        writeMem(addr, gdt_.limit, 2);
+        addr.offset += 2;
+        writeMem(addr, gdt_.base, 4);
+        break;
+    }
     case InstructionMnem::SUB:
         l = readEA(0);
         r = readEA(1);
@@ -2429,6 +2769,9 @@ DoLoop:
     case InstructionMnem::SCASB:
         doStringInstruction<InstructionMnem::SCAS>();
         break;
+    case InstructionMnem::SMSW:
+        writeEA(0, cregs_[0] & 0xffff);
+        break;
     case InstructionMnem::STC:
         flags_ |= EFLAGS_MASK_CF;
         break;
@@ -2436,11 +2779,17 @@ DoLoop:
         flags_ |= EFLAGS_MASK_DF;
         break;
     case InstructionMnem::STI:
+        checkPrivVM86();
         flags_ |= EFLAGS_MASK_IF;
         break;
     case InstructionMnem::STOS:
     case InstructionMnem::STOSB:
         doStringInstruction<InstructionMnem::STOS>();
+        break;
+    case InstructionMnem::STR:
+        if (!protectedMode())
+            THROW_UD("STR not available in real mode");
+        writeEA(0, taskIndex_);
         break;
     case InstructionMnem::TEST:
         l = readEA(0);

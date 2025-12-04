@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include "util.h"
 
 class BusDevice {
@@ -101,13 +102,17 @@ public:
     std::uint16_t readU16(std::uint64_t, std::uint64_t offset)
     {
         assert(offset + 2 <= data_.size());
-        return *(const std::uint16_t*)&data_[offset];
+        std::uint16_t res;
+        std::memcpy(&res, &data_[offset], sizeof(res));
+        return res;
     }
 
     std::uint32_t readU32(std::uint64_t, std::uint64_t offset)
     {
         assert(offset + 4 <= data_.size());
-        return *(const std::uint32_t*)&data_[offset];
+        std::uint32_t res;
+        std::memcpy(&res, &data_[offset], sizeof(res));
+        return res;
     }
 
     void writeU8(std::uint64_t addr, std::uint64_t offset, std::uint8_t value);
@@ -291,7 +296,7 @@ private:
     std::vector<IOHandlerType> ioHandlers_;
     std::vector<CycleObserver*> cycleObservers_;
     IOHandlerType defaultIoHandler_ {};
-    std::uint64_t addressMask_ = 0xfffff;
+    std::uint64_t addressMask_ = UINT64_MAX;
     std::uint64_t cycles_ = 0;
     std::uint64_t nextAction_ = 0;
 

@@ -131,6 +131,7 @@ static const DecodeTables& GetDecodeTable(const CPUInfo& info)
     case CPUModel::i8088:
     case CPUModel::i8086:
         return decodeTable_8086;
+    case CPUModel::i80386sx:
     case CPUModel::i80386:
     case CPUModel::i80586: // For now
         return decodeTable_80386;
@@ -532,7 +533,7 @@ InstructionDecodeResult Decode(const CPUInfo& cpuInfo, std::function<std::uint8_
             assert(hasModrm);
             ea.type = DecodedEAType::sreg;
             ea.regNum = ModrmReg(modrm);
-            if (cpuInfo.model < CPUModel::i80386)
+            if (cpuInfo.model < CPUModel::i80386sx)
                 ea.regNum &= 3; // Only lower two bits used
             break;
         case OperandMode::MwRv:

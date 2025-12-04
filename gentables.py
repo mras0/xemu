@@ -112,10 +112,12 @@ def is_string_op(op):
     return a == "X" or a == "Y"
 
 def output_entry(tab, opcode, e):
+
     syntax = e.find('syntax')
     mnem = syntax.find('mnem')
     if mnem is None:
         return
+
     mnem = mnem.text
     if mnem == "NOP":
         return
@@ -142,6 +144,12 @@ def output_entry(tab, opcode, e):
 
     if mnem in ["PUSHAD", "POPAD", "PUSHFD", "POPFD", "IRETD"]:
         mnem = mnem[0:-1]
+
+    if 'mod' in syntax.attrib and syntax.attrib['mod'] == 'mem':
+        assert len(ops) > 0
+        # e.g. SMSW is Mw/r16/32/64
+        if ops[0] == 'Mw':
+            ops[0] = "MwRv"
 
     if len(ops) > 0 and ops[0][0] == "Z":
         # Z: The instruction has no ModR/M byte; the three least-significant bits of the 
@@ -322,7 +330,6 @@ def handle_cpu(model):
         assert op.tag == 'pri_opcd'
         opbyte = int(op.attrib['value'], 16)
         handle_entries(tab2, op, opbyte)
-
 
     if model >= 3:
         # Handle MOV from Sreg. Word-sized for memory, but can be to a 32-bit register

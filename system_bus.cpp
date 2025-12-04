@@ -45,6 +45,7 @@ void DefaultMemHandler<ReadOnly>::writeU8(std::uint64_t addr, std::uint64_t offs
     if constexpr (ReadOnly) {
         // IBM PC XT BIOS pushes with SS=F000
         std::println("Write to ROM addr {:X} value {:02X}", addr, value);
+        //throw std::runtime_error { "XXX" };
     } else {
         assert(offset < data_.size());
         data_[offset] = value;
@@ -85,6 +86,16 @@ void SystemBus::write(std::uint64_t addr, T value)
 {
     addCycles(sizeof(T));
     addr &= addressMask_;
+
+    #if 0
+    const auto watchAddr = 0x00033046;
+    if (addr <= watchAddr && addr + sizeof(T) - 1 >= watchAddr) {
+        std::println("Write of size {} to address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2);
+        __nop();
+        //throw std::runtime_error { "FIXME" };
+    }
+    #endif
+
     if (auto ah = findHandler(memHandlers_, addr); ah) {
         if (ah->needSync)
             runCycles();
@@ -98,6 +109,8 @@ void SystemBus::write(std::uint64_t addr, T value)
         }
     } else {
         std::println("Write of size {} to unmmaped address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T)*2);
+        //if (addr != 0xb0000)
+        //    throw std::runtime_error { std::format("Write of size {} to unmmaped address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2) };
     }
 }
 

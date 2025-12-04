@@ -22,6 +22,7 @@
 //#include "devs/nec765_floppy_controller.h"
 //#include "devs/i8237a_dma_controller.h"
 
+static std::string mooTestDir = "../../../misc/SingleStepTests/";
 
 constexpr uint32_t MakeMooId(const char (&IdStr)[5])
 {
@@ -713,7 +714,7 @@ public:
     explicit MooTestMachine(CPUModel cpuModel)
         : cpu_ {cpuModel, bus_}
     {
-        const auto memSize = cpuModel >= CPUModel::i80386 ? 0x200000 : 0x100000; // 2MB / 1MB
+        const auto memSize = cpuModel >= CPUModel::i80386sx ? 0x200000 : 0x100000; // 2MB / 1MB
         bus_.setDefaultIOHandler(this);
         bus_.setAddressMask(memSize - 1);
         bus_.addMemHandler(0, memSize, *this);
@@ -751,8 +752,9 @@ public:
                 }
             }
         }
+        cpu_.prefetch_.flush(cpu_.ip_ & cpu_.ipMask());
 
-        if (cpu_.cpuInfo().model == CPUModel::i80386) {
+        if (cpu_.cpuInfo().model == CPUModel::i80386sx) {
             int exceptionNo = ExceptionNone;
             for (int i = 0;; ++i) {
                 if (i == 3)
@@ -834,16 +836,16 @@ public:
 
     std::uint8_t readU8(std::uint64_t addr, [[maybe_unused]] std::uint64_t offset) override
     {
-        // Need to support actual prefetching..
-        if (auto m = findMem(writes_, addr); m)
-            std::println("FIXME: {} {} Reading written value with readU8 of address {:05X}", test_->name, test_->id, addr);
-            //throw std::runtime_error { std::format("Reading written value with readU8 of address {:05X}", addr) };
         if (auto m = findMem(test_->init.mem, addr); m)
             return m->value;
         // ENTER (c8) test actually needs to read written data
         if (auto m = findMem(writes_, addr); m)
             return m->value;
-        throw std::runtime_error { std::format("Invalid readU8 of address {:05X}", addr) };
+
+        // Instruction prefetch may do "invalid" reads
+        //throw std::runtime_error { std::format("MOO: Invalid readU8 of address {:05X}", addr) };
+        //std::println("MOO: FIXME Invalid readU8 of address {:05X}", addr);
+        return 0xCC;
     }
     
     void writeU8(std::uint64_t addr, [[maybe_unused]] std::uint64_t offset, std::uint8_t value) override
@@ -874,7 +876,7 @@ public:
                     }
                     msg += std::format(" diff {}", FormatCPUFlags((((m->value ^ value) << 8 * writeIdx)) & ~ignore));
                 }
-            } else if (cpu_.cpuInfo().model == CPUModel::i80386 && (cpu_.lastExceptionNo() & ExceptionHardwareMask) && test_->flagsStackAddr) {
+            } else if (cpu_.cpuInfo().model == CPUModel::i80386sx && (cpu_.lastExceptionNo() & ExceptionHardwareMask) && test_->flagsStackAddr) {
                 const auto writeIdx = addr - test_->flagsStackAddr;
                 if (writeIdx < 2) {
                     const auto ignore = ignoredFlags_ | (test_->masks ? ~test_->masks->regMask[MOO_RG32_EFLAGS] : 0);
@@ -899,7 +901,7 @@ public:
 
     std::uint8_t inU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
     {
-        if (cpu_.cpuInfo().model == CPUModel::i80386) {
+        if (cpu_.cpuInfo().model == CPUModel::i80386sx) {
             // Looks like port 22h returns 7Fh and 23h 42h
             //"4fb5d80f331625dd650d55e8a1ab9d1da3b38784", // e5.MOO.gz 422 in ax,21h failed -- Invalid value for EAX 6F41FFFF expected 6F417FFF
             //"29c9c6b39824411334d44d57db62504bb4807fc6", // 66e5.MOO.gz 190 in eax,1Fh failed -- Invalid value for EAX FFFFFFFF expected 7FFFFFFF
@@ -1030,7 +1032,7 @@ private:
 #include <map>
 
 template <typename F>
-static void ForAllMooFiles(const char* path, const F& f)
+static void ForAllMooFiles(const std::string& path, const F& f)
 {
     for (auto const& dir_entry : std::filesystem::directory_iterator { path }) {
         auto ps = dir_entry.path().filename().string();
@@ -1072,10 +1074,10 @@ static void PrintTestInfo(const MooTest& test)
 
 std::string mooTestDescription;
 
-static void TestMooFile(MooTestMachine& machine, const char* filename, uint32_t ignoredFlagsMask = 0, std::function<bool (MooTest&)> filter = nullptr)
+static void TestMooFile(MooTestMachine& machine, const std::string& filename, uint32_t ignoredFlagsMask = 0, std::function<bool (MooTest&)> filter = nullptr)
 {
     std::print("{}        \r", filename);
-    GZInputStream gz { filename };
+    GZInputStream gz { filename.c_str() };
     MooFile moo { gz };
     while (moo.gotoNextTest()) {
         auto test = moo.readTestChunk();
@@ -1084,7 +1086,7 @@ static void TestMooFile(MooTestMachine& machine, const char* filename, uint32_t 
         if (blacklist.find(test.hashString()) != blacklist.end() || (filter && !filter(test)))
             continue;
         try {
-            mooTestDescription = std::format("{} {} {}", test.hashString(), strrchr(filename, '/') + 1, test.id);
+            mooTestDescription = std::format("{} {} {}", test.hashString(), strrchr(filename.c_str(), '/') + 1, test.id);
             machine.runTest(test, ignoredFlagsMask);
         } catch ([[maybe_unused]] const std::exception& e) {
             PrintTestInfo(test);
@@ -1108,7 +1110,7 @@ static void TestMooFile(MooTestMachine& machine, const char* filename, uint32_t 
     }
 }
 
-static void RunTestsInDir(CPUModel model, const char* path, const std::set<std::string>& ignoredTests, const std::map<std::string, uint32_t>& ignoredFlags)
+static void RunTestsInDir(CPUModel model, const std::string& path, const std::set<std::string>& ignoredTests, const std::map<std::string, uint32_t>& ignoredFlags)
 {
     constexpr bool checkIgnored = false;
     [[maybe_unused]] std::set<std::string> passingIgnoredTests, failedButNotIgnored;
@@ -1249,7 +1251,7 @@ struct MooDecodedInstruction {
     return res;
 }
 
-void TestMoo()
+static void TestMoo()
 {
     constexpr auto imulUndefinedFlags = EFLAGS_MASK_PF | EFLAGS_MASK_AF | EFLAGS_MASK_SF | EFLAGS_MASK_ZF;
     constexpr auto divUndefinedFlags = EFLAGS_MASK_PF | EFLAGS_MASK_AF | EFLAGS_MASK_SF | EFLAGS_MASK_ZF | EFLAGS_MASK_OF | EFLAGS_MASK_CF;
@@ -1257,7 +1259,7 @@ void TestMoo()
     constexpr auto rotUndefinedFlags = EFLAGS_MASK_AF;
 
     // TODO: v1_ex_real_mode/6766A5.MOO.gz 442 fails due to use of "SMC"
-    auto m = MooTestMachine { CPUModel::i80386 };
+    auto m = MooTestMachine { CPUModel::i80386sx };
     m.cpu().exceptionTraceMask(UINT32_MAX);
 
 #if 0
@@ -1368,12 +1370,12 @@ void TestMoo()
 
 #else
     //m.cpu().exceptionTraceMask(0);
-//    TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/f6.7.MOO.gz", rotUndefinedFlags, [](const auto& test) {
-//        if (test.id != 2348)
-//            return false;
-//        PrintTestInfo(test);
-//        return true;
-//    });
+    //TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/6669.MOO.gz", 0, [](const auto& test) {
+    //    if (test.id != 1234)
+    //        return false;
+    //    PrintTestInfo(test);
+    //    return true;
+    //});
     //TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/0faf.MOO.gz", EFLAGS_MASK_PF | EFLAGS_MASK_AF);
 #endif
 
@@ -1530,7 +1532,17 @@ void TestMoo()
             ignoredFlags80386[key] = value;
     }
 
-    RunTestsInDir(CPUModel::i80386, "../misc/SingleStepTests/386/v1_ex_real_mode/", {}, ignoredFlags80386);
+    RunTestsInDir(CPUModel::i80386sx, mooTestDir + "386/v1_ex_real_mode/", {}, ignoredFlags80386);
+    RunTestsInDir(CPUModel::i8088, mooTestDir + "8088/", {}, commonIgnoredFlags);
+}
 
-    RunTestsInDir(CPUModel::i8088, "../misc/SingleStepTests/8088/", {}, commonIgnoredFlags);
+int main()
+{
+    try {
+        TestMoo();
+    } catch (const std::exception& e) {
+        std::println("{}", e.what());
+        return 1;
+    }
+    return 0;
 }

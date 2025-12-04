@@ -1,17 +1,17 @@
 #ifndef DEBUGGER_H
 #define DEBUGGER_H
 
+#include <functional>
+
 #include "cpu.h"
 #include "system_bus.h"
 
 class DebuggerMemState {
 public:
-    DebuggerMemState()
-        : address { 0, 0, 2 }
-    {
-    }
+    DebuggerMemState();
     // TODO: How to handle use of linear/physical addresses
     // TODO: Maybe save a descriptor?
+    int sr;
     Address address;
 };
 
@@ -23,6 +23,10 @@ public:
     void commandLoop(void);
     void activate();
     void addBreakPoint(std::uint64_t physicalAddress);
+    void setOnActive(const std::function<void(bool)>& onSetActive)
+    {
+        onSetActive_ = onSetActive;
+    }
 
 private:
     struct BreakPoint {
@@ -39,12 +43,15 @@ private:
     BreakPoint breakPoints_[maxBreakPoints];
     BreakPoint autoBreakPoint_;
     uint32_t traceCount_ = 0;
+    std::function<void (bool)> onSetActive_;
 
     bool checkBreakPoint(const BreakPoint& bp);
         
     bool handleLine(const std::string& line);
-    void initMemState(DebuggerMemState& ms, uint16_t seg, uint64_t offset);
+    void initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset);
     uint64_t toPhys(const DebuggerMemState& ms, uint64_t offset);
+    uint64_t toPhys(uint64_t linearAddress);
+    uint64_t peekMem(uint64_t physAddress, size_t size);
 };
 
 #endif

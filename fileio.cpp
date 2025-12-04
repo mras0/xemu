@@ -28,3 +28,16 @@ std::vector<std::uint8_t> ReadFile(const std::string& filename)
         throw std::runtime_error { "Error reading from " + filename };
     return bytes;
 }
+
+#ifdef _MSC_VER
+#include <io.h>
+bool IsStdioInteractive(void)
+{
+    return _isatty(_fileno(stdout));
+}
+#else
+bool IsStdioInteractive(void)
+{
+    return isatty(STDOUT_FILENO);
+}
+#endif

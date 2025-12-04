@@ -15,159 +15,9 @@
 #include "devs/i8253_pit.h"
 #include "devs/nec765_floppy_controller.h"
 #include "devs/i8237a_dma_controller.h"
-
-//////////////////////////////////////////////////////////////////////////////////// 
-// Decode tests
-////////////////////////////////////////////////////////////////////////////////////
-
-struct DecodeTestCase {
-    const char* bytesHex;
-    const char* expected;
-    std::uint32_t address = 0x1000;
-};
-
-void RunTests(const CPUInfo& cpuInfo, const DecodeTestCase* tests, size_t numTests)
-{
-    for (size_t i = 0; i < numTests; ++i) {
-        const auto& tc = tests[i];
-        try {
-            const auto bytes = HexDecode(tc.bytesHex);
-            size_t offset = 0;
-            auto fetch = [&]() {
-                if (offset == bytes.size())
-                    throw std::runtime_error { "Too many bytes read" };
-                return bytes[offset++];
-            };
-            const auto res = Decode(cpuInfo, fetch);
-
-            if (res.numInstructionBytes != bytes.size() && !(res.numInstructionBytes == MaxInstructionBytes && bytes.size() > res.numInstructionBytes))
-                throw std::runtime_error { "Only " + std::to_string(res.numInstructionBytes) + " / " + std::to_string(bytes.size()) + " bytes consumed" };
-
-            const auto addr = Address { static_cast<uint16_t>(tc.address >> 16), tc.address & 0xffff, cpuInfo.defaultOperandSize };
-            const auto str = FormatDecodedInstruction(res, addr);
-
-            if (str != tc.expected) {
-                throw std::runtime_error { "Expected " + std::format("\n{:?}", tc.expected) + " got\n" + std::format("{:?}", str) };
-            }
-        } catch (const std::exception& e) {
-            throw std::runtime_error { "Test failed for " + std::string { tc.bytesHex } + ": " + e.what() };
-        }
-    }
-}
-
-template<size_t NumTests>
-void RunTests(const CPUInfo& cpuInfo, const DecodeTestCase (&tests)[NumTests])
-{
-    RunTests(cpuInfo, tests, NumTests);
-}
-
-void TestDecode16(CPUModel model)
-{
-    const CPUInfo cpuInfo = {
-        model,
-        2,
-    };
-
-    constexpr const DecodeTestCase basic[] = {
-        { "B84000", "MOV\tAX, 0x0040" },
-        { "BB5555", "MOV\tBX, 0x5555" },
-        { "CD21", "INT\t0x21" },
-        { "CC", "INT3" },
-        { "EE", "OUT\tDX, AL" },
-        { "26C706140054FF", "MOV\tWORD [ES:0x0014], 0xFF54" },
-        { "83C202", "ADD\tDX, 0x02" },
-        { "7406", "JZ\t0x02E3", 0x2DB },
-        { "26FF1E6700", "CALLF\t[ES:0x0067]" },
-        { "204269", "AND\t[BP+SI+0x69], AL" },
-        { "E80915", "CALL\t0x19EE", 0x4E2 },
-        { "2E8B14", "MOV\tDX, [CS:SI]" },
-        { "F3AA", "REP STOSB" },
-        { "F3AB", "REP STOSW" },
-        { "C3", "RETN" },
-        { "90", "NOP" },
-        { "26C51D", "LDS\tBX, [ES:DI]" },
-        { "87D1", "XCHG\tDX, CX" },
-        { "CF", "IRET" },
-        { "F6A4003F", "MUL\tBYTE [SI+0x3F00]" },
-        { "2EF6FD", "CS IDIV\tCH" },
-    };
-
-    RunTests(cpuInfo, basic);
-
-    if (model < CPUModel::i80386) {
-        // Only the two lower bits are used..
-        constexpr const DecodeTestCase t8086[] = {
-            { "268CB43D01", "MOV\t[ES:SI+0x013D], SS" },
-        };
-        RunTests(cpuInfo, t8086);
-        return;
-    }
-
-    //
-    // 386+
-    //
-    constexpr const DecodeTestCase t386[] = {
-        { "8ED8", "MOV\tDS, AX" },
-        { "6631C0", "XOR\tEAX, EAX" },
-        { "67C70485000000008BD5", "MOV\tWORD [EAX*4+0x00000000], 0xD58B" },
-        { "66B900000200", "MOV\tECX, 0x00020000" },
-        { "66F7E8", "IMUL\tEAX" },
-        { "26678803", "MOV\t[ES:EBX], AL" },
-        { "669AE513000000F0", "CALLF\t0xF000:0x000013E5" },
-        { "260FB21D", "LSS\tBX, [ES:DI]" },
-        { "8CE8", "MOV\tAX, GS" },
-        { "F3AB", "REP STOSW" },
-        { "F366AB", "REP STOSD" },
-        { "66E806000000", "CALL\t0x0000138D", 0x1381 },
-        { "67897302", "MOV\t[EBX+0x02], SI" },
-        { "60", "PUSHA" },
-        { "6660", "PUSHAD" },
-        { "61", "POPA" },
-        { "6661", "POPAD" },
-        { "2E660F011ED31B", "LIDT\t[CS:0x1BD3]" }, // o32 lidt [cs:0x1bd3]
-        { "6667399C4D00400000", "CMP\t[EBP+ECX*2+0x00004000], EBX" }, // cmp[ebp + ecx * 2 + 0x4000], ebx
-        { "0F22DE", "MOV\tCR3, ESI" },
-        { "0F20C0", "MOV\tEAX, CR0" },
-        { "EA421D1000", "JMPF\t0x0010:0x1D42" },
-        { "9C", "PUSHF" },
-        { "669C", "PUSHFD" },
-        { "9D", "POPF" },
-        { "669D", "POPFD" },
-        { "66CF", "IRETD" },
-        { "0FB5DA", "LGS\tBX, DX" }, // Invalid opcode, but allow decoding
-        { "66676B24E5750500002D", "IMUL\tESP, [0x00000575], 0x2D" },
-        { "67668CC3", "MOV\tEBX, ES" }, // N.B. unsused address-size prefix
-        { "67668C6199", "MOV\t[ECX-0x67], FS" }, // N.B. unused operand-size prefix
-        { "66666666666666666666666666666690", "UNDEF" }, // Too long
-    };
-
-    RunTests(cpuInfo, t386);
-}
-
-void TestDecode32(CPUModel model)
-{
-    const CPUInfo cpuInfo = {
-        model,
-        4,
-    };
-
-    constexpr const DecodeTestCase t386[] = {
-        { "2EC51DAF1B0000", "LDS\tEBX, [CS:0x00001BAF]" },
-        { "8D6C24FC", "LEA\tEBP, [ESP-0x04]" },
-        { "6466893B", "MOV\t[FS:EBX], DI" },
-        { "2E0FBE05A7D50000", "MOVSX\tEAX, BYTE [CS:0x0000D5A7]" },
-        { "C74500EFBEADDE", "MOV\tDWORD [EBP+0x00], 0xDEADBEEF" },
-        { "A231000000", "MOV\t[0x00000031], AL" },
-        { "882532000000", "MOV\t[0x00000032], AH" },
-        { "D1E9", "SHR\tECX, 0x01" },
-        { "F0A300000000", "LOCK MOV\t[0x00000000], EAX" },
-        { "63D8", "ARPL\tAX, BX" },
-        { "66621D00000200", "BOUND\tBX, [0x00020000]" },
-        { "66C8010000", "ENTER\t0x0001, 0x00" },
-    };
-
-    RunTests(cpuInfo, t386);
-}
+#include "devs/i8042_ps2_controller.h"
+#include "bios_replacement.h"
+#include "disk_data.h"
 
 class XTPPI : public IOHandler, public CycleObserver {
 public:
@@ -339,59 +189,56 @@ public:
     CPU cpu;
     RamHandler conventionalMem;
 
-    virtual void keyboardEvent(const decltype(GUI::Event::key)& key)
+    virtual void keyboardEvent(const KeyPress& key)
     {
         std::println("Ignoring key scanCode=0x{:02X} down={}", key.scanCode, key.down);
     }
+
+    virtual void forceRedraw() { }
 };
 
+static constexpr bool isCommPort(uint16_t port)
+{
+    // MDA LPT1
+    if (port >= 0x3BC && port <= 0x3BF)
+        return true;
 
-class Test386Machine : public BaseMachine, public IOHandler {
-public:
-    explicit Test386Machine(const char* romFileName)
-        : BaseMachine { CPUModel::i80586 } // Pretends to be 386 but tests undocumented ss > 0
-        , rom_ { ReadFile(romFileName) }
-        , debugFile_ { "out.txt", std::ofstream::binary }
-    {
-        bus.addIOHandler(debugPort, 1, *this);
-        bus.addIOHandler(postPort, 1, *this);
-        bus.addMemHandler(1024 * 1024 - rom_.size(), rom_.size(), rom_);
+    switch (port & 0xFFF8) {
+    case 0x3F8: // COM1
+    case 0x2F8: // COM2
+    case 0x3E8: // COM3
+    case 0x2E8: // COM4
+    case 0x378: // LPT1
+    case 0x278: // LPT2
+        return true;
+    default:
+        return false;
     }
+}
 
-    void outU8(uint16_t port, uint16_t, std::uint8_t value) override
-    {
-        switch (port) {
-        case debugPort:
-            debugBuffer_ += value;
-            if (value == '\n') {
-                debugFile_.write(debugBuffer_.c_str(), debugBuffer_.length());
-                debugBuffer_.clear();
-            }
-            break;
-        case postPort:
-            std::println("POST: 0x{:02X}", value);
-            if (value == 0xff) {
-                std::println("Success!");
-                debugFile_.close();
-#ifdef WIN32
-                exit(system("comp /M /L out.txt \"../misc/test386.asm/test386-EE-reference.txt\""));
-#else
-                exit(system("diff out.txt \"../misc/test386.asm/test386-EE-reference.txt\""));
-#endif
-            }
-            break;
-        default:
-            IOHandler::outU8(port, port, value);
-        }
+static constexpr bool isATAPort(uint16_t port)
+{
+    switch (port & 0xFFF8) {
+        // ATA 1
+    case 0x1f0:
+    case 0x3f0:
+        return true;
+        // ATA 2
+    case 0x170:
+    case 0x370:
+        return true;
+        // ATA 3
+    case 0x1e8:
+    case 0x3e0:
+        return true;
+        // ATA 4
+    case 0x168:
+    case 0x360:
+        return true;
+    default:
+        return false;
     }
-private:
-    static constexpr uint16_t debugPort = 0xe9;
-    static constexpr uint16_t postPort = 0x190;
-
-    RomHandler rom_;
-    std::string debugBuffer_;
-    std::ofstream debugFile_;
-};
+}
 
 class XTMachine : public BaseMachine, public IOHandler {
 public:
@@ -403,7 +250,7 @@ public:
                 // std::println("PIT interrupt");
                 pic.setInterrupt(PIC_IRQ_PIT);
             } }
-        , dma { bus, 0x00, 0x81 }
+        , dma { bus, 0x00, 0x81, false }
         , ppi { bus,
             [this](bool state) {
                 std::println("XT Keyboard interrupt state {}", state);
@@ -473,45 +320,12 @@ public:
         std::println("{} TODO: OUT 0x{:04X} 0x{:02X}", cpu.currentIp(), port, value);
     }
 
-    void keyboardEvent(const decltype(GUI::Event::key)& key) override
+    void keyboardEvent(const KeyPress& key) override
     {
         ppi.enqueueScancode(static_cast<uint8_t>(key.scanCode | (key.down ? 0 : 0x80)));
     }
 
 private:
-    static constexpr bool isCommPort(uint16_t port)
-    {
-        if (port == 0x3FA || port == 0x2FA || port == 0x3EA || port == 0x2EA || port == 0x3BE || port == 0x37A || port == 0x27A)
-            return true;
-        return port == 0x3BC || port == 0x378 || port == 0x278 || port == 0x3FB || port == 0x2FB; // LPT1-3 / COM1-2
-    }
-};
-
-class i8042_KeyboardController : public IOHandler {
-public:
-    explicit i8042_KeyboardController(SystemBus& bus)
-    {
-        bus.addIOHandler(0x60, 5, *this, true);
-    }
-
-
-    std::uint8_t inU8(std::uint16_t port, std::uint16_t offset) override
-    {
-        switch (offset) {
-        case 4:
-            std::println("i8042: TODO returning 0 for read from port {:02X}", port);
-            return 0;
-        default:
-            std::println("i8042: TODO!");
-            return IOHandler::inU8(port, offset);
-        }
-    }
-
-    void outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value) override
-    {
-        std::println("i8042: TODO!");
-        IOHandler::outU8(port, offset, value);
-    }
 };
 
 class CMOS : public IOHandler {
@@ -528,11 +342,17 @@ public:
         reg_ = 0;
     }
 
+    void set(uint8_t index, uint8_t value)
+    {
+        assert(index < data_.size());
+        data_[index] = value;
+    }
+
     std::uint8_t inU8(std::uint16_t port, std::uint16_t offset) override
     {
         switch (offset) {
         case 1:
-            std::println("CMOS: Read from reg {:02X}", reg_ & indexMask);
+            std::println("CMOS: Read from reg {:02X} -> {:02X}", reg_ & indexMask, data_[reg_ & indexMask]);
             return data_[reg_ & indexMask];
         default:
             std::println("CMOS: TODO!");
@@ -562,37 +382,232 @@ private:
     std::vector<uint8_t> data_;
 };
 
+class BochsDebugHandler : public IOHandler {
+public:
+    explicit BochsDebugHandler(SystemBus& bus)
+    {
+        bus.addIOHandler(0x80, 1, *this); // PORT_DIAG
+        bus.addIOHandler(0x400, numLevels, *this); // PANIC_PORT, ...
+    }
+
+private:
+    static constexpr std::uint16_t numLevels = 4;
+    static constexpr const char* const desc_[numLevels] = {
+        "PANIC", "PANIC2", "INFO", "DEBUG"
+    };
+    std::string buffers_[numLevels];
+    std::uint8_t diagLast_ = 0xcd;
+    std::uint32_t diagCount_ = 0;
+
+    void outU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
+    {
+        if (port == 0x80) {
+            if (value != diagLast_) {
+                std::print("BOCHS diag: 0x{:02X}", value);
+                if (diagCount_)
+                    std::print(" ({} times 0x{:02X} ignored)", diagCount_, diagLast_);
+                std::println("");
+                diagLast_ = value;
+                diagCount_ = 0;
+            } else {
+                ++diagCount_;
+            }
+            return;
+        }
+
+        assert(offset < numLevels);
+        auto& buf = buffers_[offset];
+        if (value == 10) {
+            std::println("BOCHS {}: {}", desc_[offset], buf);
+            buf.clear();
+        } else {
+            buf.push_back(value);
+        }
+    }
+};
+
+class PCIHandler : public IOHandler {
+public:
+    explicit PCIHandler(SystemBus& bus)
+    {
+        bus.addIOHandler(0x4D0, 2, *this); // IRQ
+        bus.addIOHandler(0xCF8, 8, *this); // Config
+    }
+
+    void outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value) override
+    {
+        if (port == 0x4D0 || port == 0x4D1) {
+            std::println("PCI: Ignoring IRQ config write to port {:04X} {:02X}", port, value);
+            return;
+        }
+        IOHandler::outU8(port, offset, value);
+    }
+
+    void outU32(std::uint16_t port, std::uint16_t offset, std::uint32_t value) override
+    {
+        if (offset & 3)
+            return IOHandler::outU32(port, offset, value);
+        if (offset != 0)
+            throw std::runtime_error { std::format("PCI write to address {:08X} value {:08X}", address_, value) };
+        std::println("PCI: Selecting address {:08X}", value);
+        address_ = value;
+    }
+
+    std::uint8_t inU8(std::uint16_t port, std::uint16_t offset) override
+    {
+        if (offset < 4)
+            return IOHandler::inU8(port, offset);
+        return 0xff;
+    }
+
+private:
+    uint32_t address_ = 0;
+};
+
+class A20Control : public IOHandler {
+public:
+    explicit A20Control(SystemBus& bus)
+        : bus_ { bus }
+    {
+        bus.addIOHandler(0x92, 1, *this);
+        setA20State();
+    }
+
+    uint8_t inU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        return IOHandler::inU8(port, offset);
+    }
+
+    void outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
+    {
+        std::println("Output to fast A20 port: {:02X}", value);
+        IOHandler::outU8(port, offset, value);
+    }
+
+    void setKbdA20Line(bool value)
+    {
+        kbdA20Line_ = value;
+        setA20State();
+    }
+
+private:
+    SystemBus& bus_;
+    bool prevState_ = false;
+    bool kbdA20Line_ = false;
+
+    void setA20State()
+    {
+        const bool enabled = kbdA20Line_;
+        if (enabled != prevState_) {
+            std::println("A20 gate {}!", enabled ? "enabled" : "disabled");
+            bus_.setAddressMask(UINT64_MAX & ~(enabled ? 0 : 1 << 20));
+        }
+        prevState_ = enabled;
+    }
+};
 
 class Clone386Machine : public BaseMachine, public IOHandler {
 public:
     explicit Clone386Machine()
-        : BaseMachine { CPUModel::i80386 }
-        , kbd { bus }
+        : BaseMachine { CPUModel::i80386sx }
+        , a20control { bus }
         , cmos { bus }
-        , dma1 { bus, 0x00, 0x81 }
-        , dma2 { bus, 0xC0, 0x89 }
+        , dma1 { bus, 0x00, 0x81, false }
+        , dma2 { bus, 0xC0, 0x89, true }
+        , cga { bus }
+        , pic1 { bus, 0x20 }
+        , pic2 { bus, 0xA0 }
+        , pit { bus,
+            [this]() {
+                // std::println("PIT interrupt");
+                pic1.setInterrupt(PIC_IRQ_PIT);
+            } }
+        , ps2 { bus, 
+            [this]() {
+                std::println("Keyboard interrupt");
+                pic1.setInterrupt(PIC_IRQ_KEYBOARD);
+               },
+            [this](bool value) {
+                a20control.setKbdA20Line(value);
+            }
+        }
+        , floppy {
+            bus,
+            [this]() { pic1.setInterrupt(PIC_IRQ_FLOPPY); },
+            [this](bool isPut, DMAHandler& handler) {
+                assert(!isPut);
+                (void)isPut;
+                dma1.startGet(DMA_CHANNEL_FLOPPY, handler);
+            },
+        } , extendedMem {
+            3 * 1024 * 1024
+        }
     {
         bus.setDefaultIOHandler(this);
+        cpu.setInterruptFunction([this]() { return pic1.getInterrupt(); });
+        pic1.addSlave(pic2);
+        bus.addMemHandler(1024 * 1024, extendedMem.size(), extendedMem);
     }
 
-    i8042_KeyboardController kbd;
+    A20Control a20control;
     CMOS cmos;
     i8237a_DMAController dma1;
     i8237a_DMAController dma2;
+    CGA cga;
+    i8259a_PIC pic1;
+    i8259a_PIC pic2;
+    i8253_PIT pit;
+    i8042_PS2Controller ps2;
+    NEC765_FloppyController floppy;
+    RamHandler extendedMem;
 
-
-    void outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value) override
+    void forceRedraw() override
     {
-        switch (port) {
-        case 0x80:
-        case 0xE1:
-        case 0xE2:
-        case 0x8022: // XXX???
+        cga.forceRedraw();
+    }
+
+    void keyboardEvent(const KeyPress& key) override
+    {
+        ps2.enqueueKey(key);
+    }
+
+    uint8_t inU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        if (isCommPort(port) || isATAPort(port))
+            return 0xFF;
+
+        return IOHandler::inU8(port, offset);
+    }
+
+    uint32_t inU32(std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        // FreeDOS probes this for "VMX"
+        if (port == 0x5658)
+            return UINT32_MAX;
+        return IOHandler::inU32(port, offset);
+    }
+
+    void outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
+    {
+        if (port != 0x3f8) // Serial data port
             std::println("Ignoring write to port {:02X} value {:02X}", port, value);
-            break;
-        default:
-            IOHandler::outU8(port, offset, value);
-        }
+        if (isCommPort(port) || isATAPort(port))
+            return;
+
+        //switch (port) {
+        //case 0x80:
+        //case 0xE1:
+// 
+        //case 0xE2:
+        //case 0xEA:
+        //case 0xEB:
+        //case 0xEC:
+        //case 0x8022: // XXX???
+        //    std::println("Ignoring write to port {:02X} value {:02X}", port, value);
+        //    break;
+        //default:
+        //    IOHandler::outU8(port, offset, value);
+        //}
     }
 };
 
@@ -626,50 +641,88 @@ int main()
         extern void TestDebugger();
         TestDebugger();
 
-        //constexpr const DecodeTestCase tests[] = {
-        //    { "67668C6199", "MOV\t[ECX-0x67], FS" }, // N.B. unused operand-size prefix
-        //};
-        //RunTests(CPUInfo { CPUModel::i80386, 2 }, tests);
-
-        TestDecode16(CPUModel::i8088);
-        TestDecode16(CPUModel::i8086);
-        TestDecode16(CPUModel::i80386);
-        TestDecode32(CPUModel::i80386);
-
-        extern void TestMoo();
-        //TestMoo();
-
         const int guiWidth = 640;
         const int guiHeight = 400;
 
         GUI gui { guiWidth, guiHeight };
         SetGuiActive(true);
+        [[maybe_unused]] std::vector<uint32_t> screenBuffer(guiWidth * guiHeight);
 
-#if 0
-        Test386Machine machine { "../misc/test386.asm/test386.bin" };
+
+        std::function<void(uint8_t, std::string_view)> diskInsertionEvent = [](uint8_t drive, std::string_view filename) {
+            throw std::runtime_error { std::format("No support for disk insertion in drive {:02X} {:?}", drive, filename) };
+        };
+
+#if 1
+        Clone386Machine machine;
+        machine.cga.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
+            StretchImage(&screenBuffer[0], guiWidth, guiHeight, pixels, w, h);
+            DrawScreen(screenBuffer.data());
+        });
+
+        const char* diskName = "../misc/SW/FreeDos/x86BOOT.img";
+       
+        BiosReplacement bios { machine.cpu, machine.bus };
+        try {
+            CreateDisk("hd.bin", diskFormatST157A);
+            std::println("Created HD");
+        } catch (...){}
+
+        (void)diskName;
+        //bios.insertDisk(0, diskName);
+        bios.insertDisk(0x80, "hd.bin");
+
+        diskInsertionEvent = [&](uint8_t drive, std::string_view filename) {
+            if (!filename.empty())
+                std::println("Inserting in drive {:02X}: {:?}", drive, filename);
+            else
+                std::println("Ejecting disk in drive {:02X}", drive, filename);
+            bios.insertDisk(drive, filename);
+        };
 #else
         XTMachine machine {};
         auto& bus = machine.bus;
 
-        //auto rom = RomHandler { ReadFile("../misc/pcxtbios/pcxtbios.bin") };
         auto rom = RomHandler { ReadFile("../misc/GLABIOS/GLABIOS_0.4.1_8X.ROM") };
-        // auto rom = RomHandler { ReadFile("../misc/asmtest/gfxtest/test.com") };
         bus.addMemHandler(0x100000 - rom.size(), rom.size(), rom);
-
-        std::vector<uint32_t> screenBuffer(guiWidth * guiHeight);
         machine.cga.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
             StretchImage(&screenBuffer[0], guiWidth, guiHeight, pixels, w, h);
             DrawScreen(screenBuffer.data());
         });
 
         auto& floppy = machine.floppy;
-        floppy.insertDisk(0, ReadFile(R"(../misc/sw/small.img)"));
+        floppy.insertDisk(0, ReadFile(R"(../misc/sw/swar.img)"));
 #endif
         Debugger dbg { machine.cpu, machine.bus };
         auto& cpu = machine.cpu;
 
+        struct DebugBreakHandler : public IOHandler {
+            enum : uint16_t { magicPort = 0x8abc };
+            explicit DebugBreakHandler(SystemBus& bus, Debugger& dbg)
+                : dbg_ { dbg }
+            {
+                bus.addIOHandler(magicPort, 2, *this);
+            }
+
+            void outU16(uint16_t port, uint16_t, uint16_t value) override
+            {
+                if (value == static_cast<uint16_t>(~magicPort))
+                    dbg_.activate();
+                else
+                    throw std::runtime_error { std::format("Invalid value written to debug port {:X}: {:X}", port, value) };
+            }
+
+            Debugger& dbg_;
+        } dbgBreakHandler { machine.bus, dbg };
+
+        dbg.setOnActive([&](bool active) {
+            if (active)
+                machine.forceRedraw();
+            SetGuiActive(!active);
+        });
+
         //dbg.activate();
-        //dbg.addBreakPoint((0xf000 << 4) + 0xEE6F);
+        //dbg.addBreakPoint((0xf000 << 4) + 0x9CBF);
 
         bool quit = false;
         for (unsigned guiUpdateCnt = 0; !quit;) {
@@ -684,6 +737,12 @@ int main()
                     case GUI::EventType::keyboard:
                         machine.keyboardEvent(evt.key);
                         break;
+                    case GUI::EventType::diskInsert:
+                        diskInsertionEvent(evt.diskInsert.drive, evt.diskInsert.filename);
+                        break;
+                    case GUI::EventType::diskEject:
+                        diskInsertionEvent(evt.diskEject.drive, {});
+                        break;
                     default:
                         throw std::runtime_error { "TODO: Handle event type + " + std::to_string((int)evt.type) };
                     }
@@ -692,9 +751,16 @@ int main()
 
             dbg.check();
             try {
+                //if (cpu.ip_ == 0x02CD)
+                //    __nop();
                 cpu.step();
-                //if (cpu.ip_ == 0x0000D58B) // Can hang if failure is in ring 3
-                //    throw std::runtime_error { "ERROR" };
+                //if (cpu.protectedMode() && (cpu.sdesc_[SREG_CS].flags & SD_FLAGS_MASK_DB)) {
+                //    static bool first = true;
+                //    if (first) {
+                //        first = false;
+                //        dbg.activate();
+                //    }
+                //}
             } catch (const std::exception& e) {
                 const char* const sep = "---------------------------------------------------";
                 std::println("{}", sep);

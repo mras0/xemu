@@ -10,6 +10,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <commdlg.h>
 
 namespace {
 
@@ -19,16 +20,6 @@ std::atomic<HWND> hMainWindow;
 {
     assert(error_code != ERROR_SUCCESS);
     throw std::system_error(error_code, std::system_category(), what);
-}
-
-std::map<int, uint32_t> vkMap;
-
-uint32_t VirtualKeyToScan(int vk)
-{
-    if (auto it = vkMap.find(vk); it != vkMap.end())
-        return it->second;
-    std::printf("TODO: Translate VK 0x%X\n", vk);
-    return 0;
 }
 
 template <typename Derived>
@@ -252,27 +243,105 @@ private:
     int h_;
     std::vector<GUI::Event> events_;
     bitmap_window* screen_wnd_;
+    static constexpr int maxDisks = 3;
+    static constexpr const wchar_t* const diskDescriptors[maxDisks] = {
+        TEXT("Drive &A:"),
+        TEXT("Drive &B:"),
+        TEXT("&HD")
+    };
+    static constexpr uint8_t driveId[maxDisks] = { 0x00, 0x01, 0x80};
+    std::string diskFileNames_[maxDisks];
+
 
     friend class window_base;
     static inline const wchar_t* const ClassName = L"MainWindow";
+
+    enum {
+        MENU_ID_INSERT_DISK = 1,
+        MENU_ID_EJECT_DISK = MENU_ID_INSERT_DISK + maxDisks,
+    };
     
-    void keyboard_event(bool down, int vk)
+    void onCreate()
     {
+        HMENU sysMenu = GetSystemMenu(hwnd(), FALSE);
+        for (int i = 0; i < maxDisks; ++i) {
+            HMENU subMenu = CreateMenu();
+            AppendMenu(sysMenu, MF_POPUP, (UINT_PTR)subMenu, diskDescriptors[i]);
+            AppendMenu(subMenu, MF_STRING, MENU_ID_INSERT_DISK + i, L"&Insert...");
+            AppendMenu(subMenu, MF_STRING, MENU_ID_EJECT_DISK + i, L"&Eject");
+        }
+    }
+
+    void keyboard_event(bool down, [[maybe_unused]] int vk, uint32_t info)
+    {
+        // Windows uses PS/2 Scan code set 1 internally
+        // See https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/translate.pdf
+        const auto scanCode = static_cast<uint8_t>(info >> 16);
+
         GUI::Event evt {};
         evt.type = GUI::EventType::keyboard;
         evt.key.down = down;
-        evt.key.scanCode = VirtualKeyToScan(vk);
+        evt.key.extendedKey = (info & (1 << 24)) != 0;
+        evt.key.scanCode = scanCode;
         events_.push_back(evt);
+    }
+
+    bool browseForFile(std::string& filename)
+    {
+        assert(filename.length() < MAX_PATH);
+        OPENFILENAMEA ofn;
+
+        char path[MAX_PATH];
+        ZeroMemory(&ofn, sizeof(ofn));
+        strcpy(path, filename.c_str());
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd();
+        //ofn.lpstrFilter = zz_filter;
+        //ofn.lpstrDefExt = defext;
+        ofn.lpstrFile = path;
+        ofn.nMaxFile = sizeof(path);
+        ofn.Flags = OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameA(&ofn))
+            return false;
+        filename = path;
+        return true;
+    }
+
+    void onSysCommand(int command)
+    {
+        if (command >= MENU_ID_INSERT_DISK && command < MENU_ID_INSERT_DISK + maxDisks) {
+            const auto driveIndex = command - MENU_ID_INSERT_DISK;
+            auto& filename = diskFileNames_[driveIndex];
+            if (!browseForFile(filename))
+                return;
+            GUI::Event evt {};
+            evt.type = GUI::EventType::diskInsert;
+            evt.diskInsert.drive = driveId[driveIndex];
+            strcpy(evt.diskInsert.filename, filename.c_str()); // FIXME
+            events_.push_back(evt);
+        } else if (command >= MENU_ID_EJECT_DISK && command < MENU_ID_EJECT_DISK + maxDisks) {
+            const auto driveIndex = command - MENU_ID_EJECT_DISK;
+            GUI::Event evt {};
+            evt.type = GUI::EventType::diskEject;
+            evt.diskEject.drive = driveId[driveIndex];
+            events_.push_back(evt);
+        }
     }
 
     LRESULT wndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         switch (uMsg) {
+        case WM_CREATE:
+            onCreate();
+            break;
+        case WM_SYSCOMMAND:
+            onSysCommand(LOWORD(wParam));
+            break;
         case WM_KEYDOWN:
-            keyboard_event(true, static_cast<int>(wParam));
+            keyboard_event(true, static_cast<int>(wParam), static_cast<uint32_t>(lParam));
             break;
         case WM_KEYUP:
-            keyboard_event(false, static_cast<int>(wParam));
+            keyboard_event(false, static_cast<int>(wParam), static_cast<uint32_t>(lParam));
             break;
         case WM_CLOSE:
             PostQuitMessage(0);
@@ -329,41 +398,6 @@ private:
 GUI::GUI(int w, int h, int xscale, int yscale)
     : impl_ { std::make_unique<impl>(w, h, xscale, yscale) }
 {
-    auto addRange = [](int start, const char* chs) {
-        while (*chs)
-            vkMap[*chs++] = start++;
-    };
-
-    addRange(0x02, "1234567890");
-    addRange(0x10, "QWERTYUIOP");
-    addRange(0x1E, "ASDFGHJKL");
-    addRange(0x2C, "ZXCVBNM");
-    vkMap[VK_ESCAPE] = 0x1;
-    vkMap[VK_TAB] = 0x0F;
-    vkMap[VK_BACK] = 0x0E;
-    vkMap[VK_SHIFT] = 0x2A;
-    vkMap[VK_RETURN] = 0x1C;
-    vkMap[VK_SPACE] = 0x39;
-    vkMap[VK_CONTROL] = 0x1D;
-    vkMap[VK_MENU] = 0x38;
-    
-
-    vkMap[VK_OEM_1] = 0x27; // ';:' for US
-    vkMap[VK_OEM_PLUS] = 0x0D; // '+' any country
-    vkMap[VK_OEM_COMMA] = 0x33; // ',' any country
-    vkMap[VK_OEM_MINUS] = 0x0C; // '-' any country
-    vkMap[VK_OEM_PERIOD] = 0x34; // '.' any country
-    vkMap[VK_OEM_2] = 0x35; // '/?' for US
-    //vkMap[VK_OEM_3] = 0x01; // '`~' for US
-    vkMap[VK_OEM_4] = 0x1A; //  '[{' for US
-    vkMap[VK_OEM_5] = 0x2B; //  '\|' for US
-    vkMap[VK_OEM_6] = 0x1B; //  ']}' for US
-    vkMap[VK_OEM_7] = 0x28; //  ''"' for US
-
-    
-    for (int i = VK_F1; i <= VK_F10; ++i)
-        vkMap[i] = 0x3B + (i - VK_F1);
-
 }
 
 GUI::~GUI() = default;

@@ -47,8 +47,10 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
     if (offset == 0) {
         // Command
         if (value & ICW1_MASK_INIT) {
-            if ((value & ~ICW1_MASK_INIT) != (ICW1_MASK_SINGLE | ICW1_MASK_ICW4))
+            if ((value & ~(ICW1_MASK_INIT | ICW1_MASK_SINGLE)) != ICW1_MASK_ICW4)
                 throw std::runtime_error { std::format("{}: Unsupported ICW1: {:02X}", name, value) };
+            if (!(value & ICW1_MASK_SINGLE) && !companion_)
+                throw std::runtime_error { std::format("{}: Unsupported ICW1: {:02X} - Configured in cascade mode without master/slave", name, value) };
             icw1_ = value;
             icwCnt_ = 2;
             std::println("{}: ICW1={:02X}", name, value);
@@ -91,9 +93,12 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
                 break;
             case 3:
                 assert(!(icw1_ & ICW1_MASK_SINGLE));
+                assert(companion_);
                 std::println("{}: ICW3={:02X}", name, value);
                 icw3_ = value;
                 icwCnt_ = icw1_ & ICW1_MASK_ICW4 ? 4 : 0;
+                if ((isSlave_ && icw3_ > 7) || (!isSlave_ && (icw3_ == 0 || (icw3_ & (icw3_ - 1)))))
+                    throw std::runtime_error { std::format("{}: Invalid ICW3: {:02X}", name, value) };
                 break;
             case 4:
                 assert(icw1_ & ICW1_MASK_ICW4);
@@ -115,11 +120,16 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
     }
 }
 
+uint8_t i8259a_PIC::pendingMask() const
+{
+    return irr_ & ~imr_;
+}
+
 int i8259a_PIC::getInterrupt()
 {
     if (icwCnt_)
         return -1;
-    auto pending = irr_ & ~imr_;
+    const auto pending = pendingMask();
     if (!pending)
         return -1;
 
@@ -137,12 +147,34 @@ int i8259a_PIC::getInterrupt()
 
 void i8259a_PIC::setInterrupt(std::uint8_t line)
 {
+    const uint8_t mask = static_cast<uint8_t>(1 << line);
     assert(line < 8);
-    irr_ |= 1 << line;
+    irr_ |= mask;
+
+    if (icw1_ & ICW1_MASK_SINGLE)
+        return;
+
+    // Cascade mode
+    if (isSlave_) {
+        companion_->setInterrupt(icw3_);
+        return;
+    }
+    
+    if (companion_ && (icw3_ & mask))
+        throw std::runtime_error { "TODO: Handle interrupt on master slave PIC line " + std::to_string(line) };
 }
 
 void i8259a_PIC::clearInterrupt(std::uint8_t line)
 {
     assert(line < 8);
     irr_ &= ~(1 << line);
+}
+
+void i8259a_PIC::addSlave(i8259a_PIC& slave)
+{
+    assert(companion_ == nullptr);
+    assert(slave.companion_ == nullptr);
+    companion_ = &slave;
+    slave.companion_ = this;
+    slave.isSlave_ = true;
 }

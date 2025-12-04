@@ -7,7 +7,7 @@
 
 class i8237a_DMAController {
 public:
-    explicit i8237a_DMAController(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase);
+    explicit i8237a_DMAController(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase, bool wordMode);
     ~i8237a_DMAController();
 
     void startGet(uint8_t channel, DMAHandler& handler);

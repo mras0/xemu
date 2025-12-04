@@ -1,6 +1,5 @@
 #include "debugger.h"
 #include "util.h"
-#include "gui.h"
 
 #include <iostream>
 #include <string_view>
@@ -8,12 +7,21 @@
 #include <print>
 #include <variant>
 #include <csignal>
+#include <climits>
 
 namespace {
 
 char ToUpper(char ch)
 {
     return ch >= 'a' && ch <= 'z' ? ch & ~0x20 : ch;
+}
+
+std::string ToUpperStr(std::string_view id)
+{
+    std::string upperId;
+    for (auto c : id)
+        upperId.push_back(ToUpper(c));
+    return upperId;
 }
 
 bool IsSpace(char ch)
@@ -124,13 +132,25 @@ void HexDump(Address addr, size_t size, std::function<std::optional<std::uint8_t
     }
 }
 
+static const int SREG_INVALID = -1;
+
 using RegValueType = std::pair<uint64_t*, unsigned>;
 
-RegValueType RegLookup(CPUState& st, std::string_view id)
+static int SRegLookup(std::string_view upperId)
 {
-    std::string upperId;
-    for (auto c : id)
-        upperId.push_back(ToUpper(c));
+    for (int i = 0; i < 6; ++i)
+        if (upperId == SRegText[i])
+            return i;
+    return SREG_INVALID;
+}
+
+static RegValueType RegLookup(CPUState& st, std::string_view id)
+{
+    const std::string upperId = ToUpperStr(id);
+
+    if (auto sr = SRegLookup(upperId); sr != SREG_INVALID)
+        return { reinterpret_cast<uint64_t*>(&st.sregs_[sr]), 16 };
+
     for (int i = 0; i < 8; ++i) {
         if (upperId == Reg8Text[i])
             return { &st.regs_[i & 3], i & 4 };
@@ -138,8 +158,6 @@ RegValueType RegLookup(CPUState& st, std::string_view id)
             return { &st.regs_[i], 16 };
         if (upperId == Reg32Text[i])
             return { &st.regs_[i], 32 };
-        if (i < 6 && upperId == SRegText[i])
-            return { reinterpret_cast<uint64_t*>(&st.sregs_[i]), 16 };
     }
 
     if (upperId == "IP")
@@ -209,10 +227,25 @@ uint64_t GetPhysicalIp(const CPUState& st)
 
 } // unnamed namespace
 
+
+DebuggerMemState::DebuggerMemState()
+    : sr { SREG_INVALID }
+    , address { 0, 0, 2 }
+{
+}
+
 class DebuggerLineParser {
 public:
     using LookupResult = std::variant<std::monostate, std::uint64_t, std::function<std::uint64_t(const std::vector<std::uint64_t>&)>>;
     using LookupFunction = std::function<LookupResult (std::string_view)>;
+
+    struct Address {
+        std::variant<std::monostate, SReg, uint16_t> segment;
+        std::uint64_t offset;
+
+        bool operator==(const Address&) const = default;
+    };
+
 
     explicit DebuggerLineParser(const std::string& line, LookupFunction lookup = {})
         : line_ { line }
@@ -224,12 +257,19 @@ public:
         return pos_ == line_.length();
     }
 
+    std::string_view peekWord()
+    {
+        size_t end = pos_;
+        while (end < line_.length() && !IsSpace(static_cast<uint8_t>(line_[end])))
+            ++end;
+        return std::string_view { line_.begin() + pos_, line_.begin() + end };
+    }
+
     std::string_view getWord()
     {
-        size_t beg = pos_;
-        while (pos_ < line_.length() && !IsSpace(static_cast<uint8_t>(line_[pos_])))
-            ++pos_;
-        return std::string_view { line_.begin() + beg, line_.begin() + pos_ };
+        const auto word = peekWord();
+        pos_ += word.length();
+        return word;
     }
 
     void skipSpace()
@@ -240,24 +280,39 @@ public:
 
     std::optional<std::uint64_t> getNumber();
 
-    std::optional<Address> getAddress(std::optional<std::uint64_t> defaultSegment)
+    std::optional<Address> getAddress()
     {
-        auto seg = getNumber();
-        if (!seg)
+        auto segWord = peekWord();
+        if (segWord.empty())
             return {};
+        if (segWord.find_first_of(':') == 2)
+            segWord = segWord.substr(0, 2);
+        else
+            segWord = "";
+        auto segValue = getNumber();
+        if (!segValue)
+            return {};
+
         if (atEnd() || line_[pos_] != ':') {
-            if (defaultSegment)
-                return Address { static_cast<uint16_t>(*defaultSegment), *seg, 4 };
-            throw std::runtime_error { std::format("TODO: Address without segment: 0x{:X}", *seg) };
+            return Address { {}, *segValue };
         }
+
+        Address a {};
+        if (auto sr = SRegLookup(ToUpperStr(segWord)); static_cast<int>(sr) != SREG_INVALID) {
+            a.segment = static_cast<SReg>(sr);
+        } else {
+            if (*segValue > 0xffff)
+                throw std::runtime_error { std::format("Segment 0x{:X} is too large", *segValue) };
+            a.segment = static_cast<uint16_t>(*segValue);
+        }
+
         assert(line_[pos_] == ':');
         pos_++;
-        if (*seg > 0xffff)
-            throw std::runtime_error { std::format("Segment 0x{:X} is too large", *seg) };
         auto ofs = getNumber();
         if (!ofs)
             throw std::runtime_error { std::format("Invalid offset") };
-        return Address { static_cast<uint16_t>(*seg), *ofs, 4 };
+        a.offset = *ofs;
+        return a;
     }
 
     char get()
@@ -547,6 +602,38 @@ DebuggerLineParser::LookupResult DebuggerLineParser::builtinLookup(std::string_v
     return {};
 }
 
+template <>
+struct std::formatter<DebuggerLineParser::Address> : std::formatter<const char*> {
+    auto format(const DebuggerLineParser::Address& a, std::format_context& ctx) const
+    {
+        std::string s;
+        switch (a.segment.index()) {
+        case 0:
+            break;
+        case 1:
+            s = std::string(SRegText[std::get<1>(a.segment)]) + ":";
+            break;
+        case 2:
+            s = std::format("{:04X}:", std::get<2>(a.segment));
+            break;
+        }
+        s += std::format("{:X}", a.offset);
+        return std::formatter<const char*>::format(s.c_str(), ctx);
+    }
+};
+
+
+template <>
+struct std::formatter<DebuggerMemState> : std::formatter<const char*> {
+    auto format(const DebuggerMemState& ms, std::format_context& ctx) const
+    {
+        std::string s;
+        if (ms.sr != SREG_INVALID)
+            s = std::format("{} ", SRegText[ms.sr]);
+        s += std::format("{}", ms.address);
+        return std::formatter<const char*>::format(s.c_str(), ctx);
+    }
+};
 
 Debugger::Debugger(CPU& cpu, SystemBus& bus)
     : cpu_ { cpu }
@@ -555,21 +642,38 @@ Debugger::Debugger(CPU& cpu, SystemBus& bus)
     InstallBreakHandler();
 }
 
-void Debugger::initMemState(DebuggerMemState& ms, uint16_t seg, uint64_t offset)
+void Debugger::initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset)
 {
-    assert(!cpu_.protectedMode()); // TODO
-    ms.address = Address { seg, offset, 2 };
+    assert(static_cast<uint32_t>(sr) <= 6);
+    ms.sr = sr;
+    ms.address = Address { cpu_.sregs_[sr], offset, static_cast<uint8_t>(cpu_.protectedMode() ? 4 : 2) };
+}
+
+uint64_t Debugger::toPhys(uint64_t linearAddress)
+{
+    if (!cpu_.pagingEnabled())
+        return linearAddress;
+    const auto pde = peekMem(cpu_.cregs_[3] + (linearAddress >> 22) * 4, 4);
+    if (!(pde & PT32_MASK_P))
+        throw std::runtime_error { std::format("{:08X} not present in PD", linearAddress) };
+    const auto pte = peekMem((pde & PT32_MASK_ADDR) + ((linearAddress >> 12) & 1023) * 4, 4);
+    if (!(pte & PT32_MASK_P))
+        throw std::runtime_error { std::format("{:08X} not present in PT", linearAddress) };
+    return (pte & PT32_MASK_P) + (linearAddress & PAGE_MASK);
 }
 
 uint64_t Debugger::toPhys(const DebuggerMemState& ms, uint64_t offset)
 {
-    assert(!cpu_.protectedMode()); // TODO
-    //    const auto& desc = cpu_.sdesc_[ms.address.segment()];
-    //    const auto ofs = ms.address.offset() + offset;
-    //    assert(ofs < desc.limit); // TODO
-    //    return desc.base + ofs;
     const auto& a = ms.address;
-    return a.segment() * 16 + a.offset() + offset;
+    offset += a.offset();
+    if (ms.sr != SREG_INVALID)
+        return toPhys(cpu_.sdesc_[ms.sr].base + offset);
+
+    if (cpu_.protectedMode()) {
+        std::println("WARNING: Protected mode enabled and sr is invalid!");
+    }
+
+    return toPhys(a.segment() * 16 + offset);
 }
 
 void Debugger::activate()
@@ -578,8 +682,9 @@ void Debugger::activate()
         active_ = true;
         traceCount_ = 0;
         autoBreakPoint_.active = false;
-        initMemState(disAsmAddr_, cpu_.sregs_[SREG_CS], cpu_.ip_);
-        SetGuiActive(false);
+        initMemState(disAsmAddr_, SREG_CS, cpu_.ip_);
+        if (onSetActive_)
+            onSetActive_(true);
     }
 }
 
@@ -637,7 +742,8 @@ void Debugger::commandLoop()
     }
 
     active_ = false;
-    SetGuiActive(true);
+    if (onSetActive_)
+        onSetActive_(false);
 }
 
 void Debugger::addBreakPoint(std::uint64_t physicalAddress)
@@ -654,6 +760,15 @@ void Debugger::addBreakPoint(std::uint64_t physicalAddress)
     throw std::runtime_error { "Too many breakpoints" };
 }
 
+uint64_t Debugger::peekMem(uint64_t physAddress, size_t size)
+{
+    assert(size <= 8);
+    uint64_t value = 0;
+    for (size_t i = size; i--;)
+        value = value << 8 | bus_.peekU8(physAddress + i);
+    return value;
+}
+
 bool Debugger::handleLine(const std::string& line)
 {
     assert(!line.empty());
@@ -662,11 +777,7 @@ bool Debugger::handleLine(const std::string& line)
         return [this, size](const std::vector<uint64_t>& args) -> std::uint64_t {
             if (args.size() != 1)
                 throw std::runtime_error { std::format("Invalid number of arguments for m{}", 8 << size) };
-            uint64_t value = 0;
-            auto addr = args[0];
-            for (size_t i = size; i--;)
-                value = value << 8 | bus_.peekU8(addr + i);
-            return value;
+            return peekMem(args[0], size);
         };
     };
 
@@ -700,18 +811,41 @@ bool Debugger::handleLine(const std::string& line)
     assert(!cmd.empty());
     parser.skipSpace();
 
-    auto getAddressAndNumLines = [&](DebuggerMemState& memState) {
-        uint64_t numLines = 10;
-        if (auto addr = parser.getAddress(memState.address.segment())) {
-            initMemState(memState, addr->segment(), addr->offset());
-            parser.skipSpace();
-            if (auto nl = parser.getNumber(); nl) {
-                if (*nl < 1000)
-                    numLines = *nl;
-                else
-                    std::print("Too many lines {}\n", *nl);
+    auto getAddress = [&](DebuggerMemState& memState) {
+        if (auto addr = parser.getAddress(); addr) {
+            switch (addr->segment.index()) {
+            case 0:
+                memState.address = Address { memState.address.segment(), addr->offset, memState.address.offsetSize() };
+                break;
+            case 1:
+                initMemState(memState, std::get<1>(addr->segment), addr->offset);
+                break;
+            case 2:
+                memState.sr = SREG_INVALID;
+                memState.address = Address { std::get<2>(addr->segment), addr->offset, memState.address.offsetSize() };
+                break;
             }
+            parser.skipSpace();
+            return true;
         }
+        return false;
+    };
+
+    constexpr uint64_t defaultNumLines = 10;
+    auto getLines = [&]() {
+        if (auto nl = parser.getNumber(); nl) {
+            if (*nl < 1000)
+                return *nl;
+            else
+                std::print("Too many lines {}\n", *nl);
+        }
+        return defaultNumLines;
+    };
+
+    auto getAddressAndNumLines = [&](DebuggerMemState& memState) {
+        uint64_t numLines = defaultNumLines;
+        if (getAddress(memState))
+            numLines = getLines();
         return numLines;
     };
 
@@ -731,17 +865,36 @@ bool Debugger::handleLine(const std::string& line)
         if (!phys)
             throw std::runtime_error { "Physical address missing" };
         addBreakPoint(*phys);
-    } else if (cmd == "d") {
-        uint64_t numLines = getAddressAndNumLines(disAsmAddr_);
+    } else if (cmd == "d" || cmd == "dp" || cmd == "d16" || cmd == "d32" || cmd == "dp16" || cmd == "dp32") {
+        const bool isPhys = cmd.length() > 1 && cmd[1] == 'p';
+        auto cpuInfo = cpu_.cpuInfo();
+        if (cmd.ends_with("16"))
+            cpuInfo.defaultOperandSize = 2;
+        else if (cmd.ends_with("32"))
+            cpuInfo.defaultOperandSize = 4;
+
+        uint64_t numLines = defaultNumLines;
+        if (isPhys) {
+            if (auto physAddr = parser.getNumber(); physAddr) {
+                disAsmAddr_.sr = SREG_INVALID;
+                disAsmAddr_.address = Address { 0, *physAddr, cpu_.defaultOperandSize() };
+                numLines = getLines();
+            }
+        } else {
+            numLines = getAddressAndNumLines(disAsmAddr_);
+        }
+        uint64_t offset;
+        auto ifetch = [&]() {
+            uint64_t addr = isPhys ? disAsmAddr_.address.offset() : toPhys(disAsmAddr_, offset);
+            offset++;
+            return bus_.peekU8(addr);
+        };
 
         auto& addr = disAsmAddr_.address;
         while (numLines--) {
-            uint64_t offset = 0;
-            auto ifetch = [&]() {
-                return bus_.peekU8(toPhys(disAsmAddr_, offset++));
-            };
+            offset = 0;
             try {
-                auto res = Decode(cpu_.cpuInfo(), ifetch);
+                auto res = Decode(cpuInfo, ifetch);
                 std::print("{}\n", FormatDecodedInstructionFull(res, addr));
                 addr += res.numInstructionBytes;
             } catch (const std::exception& e) {
@@ -751,8 +904,34 @@ bool Debugger::handleLine(const std::string& line)
         }
     } else if (cmd == "g") {
         return false;
+    } else if (cmd == "gdt") {
+        const auto& gdt = cpu_.gdt_;
+        std::println("GDT base={:08X} limit={:04X}", gdt.base, gdt.limit);
+        for (uint32_t offset = 0; offset + 7 <= gdt.limit; offset += 8) {
+            const auto descValue = peekMem(toPhys(gdt.base + offset), 8);
+            if (descValue & DESCRIPTOR_MASK_PRESENT) {
+                const auto desc = SegmentDescriptor::fromU64(descValue);
+                std::println("{:02X} {:016X} {}", offset, descValue, desc);
+            }
+        }
     } else if (cmd == "h") {
         cpu_.showHistory();
+    } else if (cmd == "hc") {
+        cpu_.showControlTransferHistory();
+    } else if (cmd == "idt") {
+        const auto& idt = cpu_.idt_;
+        std::println("IDT base={:08X} limit={:04X}", idt.base, idt.limit);
+        for (uint32_t idtOffset = 0; idtOffset + 7 <= idt.limit; idtOffset += 8) {
+            const auto desc = peekMem(toPhys(idt.base + idtOffset), 8);
+            if (desc) {
+                const auto offset = (desc & 0xffff) | ((desc >> 48) << 16);
+                const auto selector = static_cast<uint16_t>((desc >> 16) & 0xffff);
+                const auto flags = (desc >> 40) & 0xff;
+                const auto type = flags & 0xf;
+                const auto dpl = (flags >> 5) & 3;
+                std::println("Int{:02X} {:016X} {:X}:{:08X} DPL={} Type={:02X}", idtOffset / 8, desc, selector, offset, dpl, type);
+            }
+        }
     } else if (cmd == "m") {
         uint64_t numLines = getAddressAndNumLines(hexDumpAddr_);
         HexDump(hexDumpAddr_.address, numLines * 16, [&](uint64_t offset) -> std::optional<std::uint8_t> {
@@ -763,6 +942,11 @@ bool Debugger::handleLine(const std::string& line)
             }
         });
         hexDumpAddr_.address += numLines * 16;
+    } else if (cmd == "phys") {
+        DebuggerMemState ms;
+        initMemState(ms, SREG_CS, 0);
+        if (getAddress(ms))
+            std::println("{} - {:08X}", ms, toPhys(ms, 0));
     } else if (cmd == "r") {
         if (auto regName = parser.getWord(); !regName.empty()) {
             if (auto regInfo = RegLookup(cpu_, regName); regInfo.first) {
@@ -771,6 +955,10 @@ bool Debugger::handleLine(const std::string& line)
                 if (!value)
                     throw std::runtime_error { std::format("Value expected for {}", regName) };
                 RegSet(regInfo, *value);
+                // For safety's sake clear the prefetch buffer
+                // TODO: Handle changing of sregs in protected mode
+                std::println("Clearing prefetch buffer");
+                cpu_.prefetch_.flush(cpu_.ip_ & cpu_.ipMask());
             } else {
                 throw std::runtime_error { std::format("Invalid register {}", regName) };
             }
@@ -869,19 +1057,36 @@ void TestDebugger()
         { "s32(41ffff0000)", (uint64_t)-65536 },
     };
 
-    const uint16_t defaultSegment = 0xCCDD;
     const struct {
         const char* text;
-        Address addr;
+        DebuggerLineParser::Address addr;
     } addressTests[] = {
-        { "aBcD:5678", Address { 0xabcd, 0x5678, 4 } },
-        { "42", Address { defaultSegment, 0x42, 4 } },
-        { "ax:0", Address { 0x1234, 0, 4 } },
+        { "aBcD:5678", { uint16_t(0xabcd), 0x5678 } },
+        { "42", { {}, 0x42 } },
+        { "ax:2+3", { uint16_t(0x1234), 5 } },
+        { "cs:1234", { SREG_CS, 0x1234 } },
+        { "ds:0", { SREG_DS, 0 } },
+        { "es:0", { SREG_ES, 0 } },
+        { "ss:0", { SREG_SS, 0 } },
+        { "fs:0", { SREG_FS, 0 } },
+        { "gs:12345678", { SREG_GS, 0x12345678 } },
+        { "fs", { {}, 0xf5f5 } },
+        { "fs+2:2a", { uint16_t(0xf5f5+2), 42 } },
+        { "CS:0", { SREG_CS, 0 } },
+        { "DS:0", { SREG_DS, 0 } },
+        { "eS:0", { SREG_ES, 0 } },
+        { "Ss:0", { SREG_SS, 0 } },
+        { "FS:0", { SREG_FS, 0 } },
+        { "GS:0", { SREG_GS, 0 } },
     };
 
     DebuggerLineParser::LookupFunction lookupFunc = [](std::string_view id) -> DebuggerLineParser::LookupResult {
         if (id == "ax")
             return 0x1234ULL;
+        if (id == "fs")
+            return 0xf5f5ULL;
+        if (SRegLookup(ToUpperStr(id)) != SREG_INVALID)
+            return 0xcdcdULL;
         if (id == "not")
             return [](const std::vector<std::uint64_t>& args) {
                 if (args.size() != 1)
@@ -916,10 +1121,10 @@ void TestDebugger()
         try {
             const std::string line { text };
             DebuggerLineParser lp { line, lookupFunc };
-            auto addr = lp.getAddress(defaultSegment);
+            auto addr = lp.getAddress();
             if (!addr)
                 throw std::runtime_error { "No address returned" };
-            if (addr->segment() != expected.segment() || addr->offset() != expected.offset())
+            if (*addr != expected)
                 throw std::runtime_error { std::format("Got {} expected {}", *addr, expected) };
         } catch (const std::exception& e) {
             std::cout << "Test failed for " << text << ": " << e.what() << "\n";

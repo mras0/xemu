@@ -12,6 +12,7 @@ enum class CPUModel {
     i8086,
     i80186,
     i80286,
+    i80386sx,
     i80386,
     i80486,
     i80586,

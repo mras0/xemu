@@ -61,6 +61,6 @@ std::string FormatExceptionNumber(int exceptionNo)
         else
             return std::format("Exception {}", no);
     } else {
-        return std::format("Interrupt {}", exceptionNo);
+        return std::format("Interrupt 0x{:02X}", exceptionNo);
     }
 }

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "keyboard.h"
 
 class GUI {
 public:
@@ -12,16 +13,22 @@ public:
 
     enum class EventType {
         quit,
-        keyboard
+        keyboard,
+        diskInsert,
+        diskEject,
     };
 
     struct Event {
         EventType type;
         union {
+            KeyPress key;
             struct {
-                bool down;
-                uint32_t scanCode;
-            } key;
+                std::uint8_t drive;
+                char filename[256]; // FIXME
+            } diskInsert;
+            struct {
+                std::uint8_t drive;
+            } diskEject;
         };
     };
 

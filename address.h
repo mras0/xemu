@@ -6,6 +6,13 @@
 
 class Address {
 public:
+    constexpr explicit Address()
+        : segment_ { 0 }
+        , offset_ { UINT64_MAX }
+        , offsetSize_ { 8 }
+    {
+    }
+
     constexpr explicit Address(std::uint16_t segment, std::uint64_t offset, std::uint8_t offsetSize)
         : segment_ { segment }
         , offset_ { offset }

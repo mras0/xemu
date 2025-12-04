@@ -13,6 +13,7 @@ public:
     ~CGA();
 
     void setDrawFunction(const DrawFunction& onDraw);
+    void forceRedraw();
 
 private:
     class impl;
