@@ -36,6 +36,8 @@ struc   BDA
         bda_hdCount             resb 1          ; 75h Fixed disk: number of fixed disk drives
         bda_fill2               resb 14
         bda_videoCharRows       resb 1          ; 84h Video EGA/MCGA/VGA rows on screen minus one
+                                resb 0xc0-0x85
+        bda_tempExtMem          resw 1          ; Normally reserved
 endstruc
 
 %macro CHECK_OFFSET 2
@@ -53,6 +55,7 @@ endstruc
         CHECK_OFFSET bda_timerOverflow,0x70
         CHECK_OFFSET bda_hdCount,0x75
         CHECK_OFFSET bda_videoCharRows,0x84
+        CHECK_OFFSET bda_tempExtMem,0xC0
 
 %macro DEBUG_BREAK 0
         push    ax

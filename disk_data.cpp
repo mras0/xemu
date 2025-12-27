@@ -3,6 +3,31 @@
 #include <stdexcept>
 #include <cassert>
 
+namespace {
+
+DiskFormat DiskFormatFromData(const std::vector<uint8_t>& data)
+{
+    //static constexpr DiskFormat diskFormat180K = { 40, 1, 9 };
+    if (data.size() < bytesPerSector)
+        throw std::runtime_error { "Disk is too small" };
+    try {
+        return DiskFormatFromBootSector(data);
+    } catch ([[maybe_unused]] const std::exception& e) {
+        try {
+            return DiskFormatFromSize(data.size());
+        } catch ([[maybe_unused]] const std::exception& e2) {
+            // Fake up a single sided format for small disks
+            const auto cylSize = 9 * bytesPerSector;
+            const auto numCyls = data.size() / cylSize;
+            if (data.size() % cylSize || !numCyls || numCyls > 40)
+                throw std::runtime_error { "Disk size is wrong for fake format" };
+            return DiskFormat { static_cast<uint32_t>(numCyls), 1U, 9U };
+        }
+    }
+}
+
+} // unnamed namespace
+
 void DiskData::eject()
 {
     data.clear();
@@ -13,9 +38,7 @@ void DiskData::eject()
 
 void DiskData::insert(std::vector<uint8_t>&& inData)
 {
-    if (inData.size() < 512)
-        throw std::runtime_error{"Disk is too small"};
-    const auto fmt = DiskFormatFromBootSector(inData);
+    const auto fmt = DiskFormatFromData(inData);
     eject();
     data = std::move(inData);
     format = fmt;
@@ -44,14 +67,7 @@ void DiskData::insert(std::string_view diskFilename)
     if (!*diskFile)
         throw std::runtime_error { std::format("Failed to read from {:?}", diskFilename) };
 
-    //LOG("Inserting in drive {:02X}: {:?} {} MB", drive, filename, size / (1024.*1024));
-    DiskFormat fmt;
-    try {
-        fmt = DiskFormatFromBootSector(diskData);
-    } catch ([[maybe_unused]] const std::exception& e) {
-        //LOG("{}", e.what());
-        fmt = DiskFormatFromSize(diskData.size());
-    }
+    DiskFormat fmt = DiskFormatFromData(diskData);
     //LOG("Format: {}/{}/{}", fmt.numCylinder, fmt.headsPerCylinder, fmt.sectorsPerTrack);
     eject();
     data = std::move(diskData);

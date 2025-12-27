@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <cassert>
 #include "cpu_descriptor.h"
 #include "cpu_registers.h"
@@ -67,7 +68,7 @@ constexpr uint32_t PT32_MASK_ADDR = 0xfffff000; // Bit 31-12
 constexpr uint32_t PAGE_MASK = ~PT32_MASK_ADDR; // Bit 11-0
 static_assert(PAGE_MASK == 4095);
 constexpr uint32_t PT32_SHIFT = 12;
-
+constexpr uint32_t PAGE_SIZE = 1 << PT32_SHIFT;
 
 static constexpr uint32_t TLB_MASK_W = 1 << 6; // Read/Write
 static constexpr uint32_t TLB_MASK_U = 1 << 10; // User/Supervisor
@@ -102,16 +103,19 @@ struct CPUState {
     std::uint64_t regs_[16];
     std::uint16_t sregs_[6];
     std::uint64_t cregs_[8];
+    std::uint64_t dregs_[8];
     std::uint64_t ip_;
     std::uint32_t flags_;
     DescriptorTable idt_;
     DescriptorTable gdt_;
     SegmentDescriptor sdesc_[6];
     SegmentDescriptor ldt_;
+    uint16_t ldtIndex_;
     SegmentDescriptor task_;
     uint16_t taskIndex_;
     PrefixFetchQueue prefetch_;
     TLB tlb_;
+    bool intDelay_;
 
     bool protectedMode() const
     {
@@ -182,7 +186,7 @@ public:
 
     explicit CPU(CPUModel cpuModel, SystemBus& bus);
 
-    static constexpr size_t MaxHistory = 64;
+    static constexpr size_t MaxHistory = 256;
 
     void reset();
     void setInterruptFunction(InterruptFunc func)
@@ -205,6 +209,7 @@ public:
     Address currentIp() const;
     int lastExceptionNo() const;
     void loadSreg(SReg sr, std::uint16_t value);
+    void setCreg(std::uint8_t index, std::uint32_t value);
 
     uint32_t exceptionTraceMask() const
     {
@@ -236,22 +241,17 @@ private:
     uint32_t exceptionTraceMask_ = UINT32_MAX & ~(1 << 0); // #DE
 
     static constexpr size_t maxControlTransferHistory = 64;
-    Address controlTransferHistory_[maxControlTransferHistory];
+    struct {
+        Address addr;
+        Address destination;
+        InstructionMnem ins;
+        uint32_t count;
+    } controlTransferHistory_[maxControlTransferHistory];
     size_t controlTransferHistoryCount_ = 0;
 
-    struct VerifiedAddress {
-        SegmentedAddress addr;
-        uint64_t physicalAddress;
-        uint8_t size;
-        bool valid;
-        bool forWrite;
-    };
-    VerifiedAddress verifiedAddresses_[2];
-    uint64_t verifyAddress(const SegmentedAddress& addr, uint8_t size, bool forWrite);
-
+    // Instruction fetching
     void instructionPrefetch();
     bool instructionFetch(bool prefetch);
-    std::uint8_t peekCodeByte(uint64_t offset);
 
     SegmentedAddress currentSp() const;
 
@@ -261,43 +261,58 @@ private:
     void setFlags(std::uint32_t value);
     uint32_t filterFlags(std::uint32_t flags, bool op16bit);
 
+    // EA
     std::uint64_t readEA(int index);
     void writeEA(int index, std::uint64_t value);
     SegmentedAddress calcAddress(const DecodedEA& ea) const;
     SegmentedAddress calcAddressNoMask(const DecodedEA& ea) const;
-    Address readFarPtr(const DecodedEA& addrEa);
 
+    // Paging
     std::uint64_t pageLookup(std::uint64_t linearAddress, std::uint32_t lookupFlags);
-    std::uint64_t toLinearAddress(const SegmentedAddress& address, std::uint8_t accessSize) const;
-    std::uint64_t toPhysicalAddress(const SegmentedAddress& address, std::uint8_t accessSize, std::uint32_t lookupFlags);
 
-    std::uint64_t readMem(const SegmentedAddress& address, std::uint8_t size);
-    std::uint64_t readMemLinear(std::uint64_t address, std::uint8_t size, uint32_t lookupFlags = 0);
+    // Physical access
     std::uint64_t readMemPhysical(std::uint64_t address, std::uint8_t size);
-
-    void writeMem(const SegmentedAddress& address, std::uint64_t value, std::uint8_t size);
     void writeMemPhysical(std::uint64_t address, std::uint64_t value, std::uint8_t size);
 
+    // Linear access
+    std::uint64_t toPhysicalAddress(uint64_t linearAddress, std::uint32_t lookupFlags);
+    std::uint64_t readMemLinear(std::uint64_t linearAddress, std::uint8_t size, uint32_t lookupFlags = 0);
+    void writeMemLinear(std::uint64_t linearAddress, std::uint64_t value, std::uint8_t size, uint32_t lookupFlags = 0);
+    
+    // Logical access    
+    std::uint64_t toLinearAddress(const SegmentedAddress& address, std::uint8_t size, bool forWrite);
+    void writeMem(const SegmentedAddress& address, std::uint64_t value, std::uint8_t size);
+    std::uint64_t readMem(const SegmentedAddress& address, std::uint8_t size);
+    std::optional<std::uint64_t> peekMem(const SegmentedAddress& address, std::uint8_t size);
+
+    // Memory access helpers
+    std::uint64_t descriptorLinearAddress(std::uint16_t value);
+    Address readFarPtr(const DecodedEA& addrEa);
+    uint64_t readDescriptorValue(uint64_t linearAddress);
     SegmentDescriptor readDescriptor(std::uint16_t value);
 
+    // Stack helpers
     void push(std::uint64_t value, std::uint8_t size = 0); // 0 = default operand size
     std::uint64_t pop(std::uint8_t size = 0); // 0 = default operand size
     std::uint64_t readStack(std::int32_t itemOffset);
     void writeStack(std::int32_t itemOffset, std::uint64_t value);
     void updateSp(std::int32_t itemCount);
 
-    enum class ControlTransferType { jump, call, interrupt, max };
+    enum class ControlTransferType { jump, call, int32, int16, iret, retf, max };
     void doStep();
     void doControlTransfer(std::uint16_t cs, std::uint64_t ip, ControlTransferType type);
     void doNearControlTransfer(ControlTransferType type);
-    void doInterrupt(std::uint8_t interruptNo, bool hardwareInterrupt);
+    void doInterrupt(int interrupt, std::uint32_t errorCode = 0);
     void doInterruptReturn();
+    void doFarReturn(uint16_t bytesToPop);
 
     std::uint64_t tssAddress(std::uint32_t limitCheck);
     void tssSaveStack();
-    void tssRestoreStack(std::uint8_t newCpl, bool fromVM86);
+    void tssRestoreStack(std::uint8_t newCpl, bool fromVM86, std::uint8_t stackOpSize);
 
     void changeCpl(uint8_t newCpl);
+    void clearSreg(SReg sr);
+    void clearAllSregs();
 
     template<InstructionMnem>
     void doStringInstruction();
@@ -309,12 +324,17 @@ private:
     void doLoadFarPointer();
     
     void checkPriv(std::uint32_t errorCode);
+    void checkPrivIOPL();
     void checkPrivVM86();
+    void checkPmode();
+    void checkIOAccess(std::uint16_t port, std::uint8_t size);
+
     void checkSreg(std::uint8_t regNum);
 
     void flushTLB();
 
-    void recordControlTransfer();
+    void recordControlTransfer(uint16_t cs, uint64_t ip);
+    void checkIpLimit(uint16_t cs, uint64_t ip);
 };
 
 constexpr bool Parity(uint8_t v) // Returns true if parity bit should be set

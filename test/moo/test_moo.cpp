@@ -791,7 +791,7 @@ public:
                     continue;
                 if (i == MOO_RG16_FLAGS) {
                     const auto flagDiff = (val ^ expected) & ~ignoredFlagsMask;
-                    if (flagDiff == 0 || (cpu_.cpuInfo().model == CPUModel::i8088 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionHardwareMask)))
+                    if (flagDiff == 0 || (cpu_.cpuInfo().model == CPUModel::i8088 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionTypeCPU)))
                         continue;
                     throw std::runtime_error { std::format("Invalid value for flags {} expected {}, difference {} (ignored mask {:04X})", FormatCPUFlags(val), FormatCPUFlags(expected), FormatCPUFlags(flagDiff), ignoredFlagsMask) };
                 } else {
@@ -864,7 +864,7 @@ public:
             auto msg = std::format("Unexpected write to {:05X} value {:02X} expected {:02X}", addr, value, m->value);
 
             // Hack to ignore flags on division error
-            if (cpu_.cpuInfo().model == CPUModel::i8088 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionHardwareMask)) {
+            if (cpu_.cpuInfo().model == CPUModel::i8088 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionTypeCPU)) {
                 const auto writeIdx = m - &test_->fina.mem[0];
                 if (writeIdx < 2) {
                     const auto ignore = ignoredFlags_ | EFLAGS_MASK_PF | EFLAGS_MASK_ZF; // Always ignore ZF/PF on exception..
@@ -876,7 +876,7 @@ public:
                     }
                     msg += std::format(" diff {}", FormatCPUFlags((((m->value ^ value) << 8 * writeIdx)) & ~ignore));
                 }
-            } else if (cpu_.cpuInfo().model == CPUModel::i80386sx && (cpu_.lastExceptionNo() & ExceptionHardwareMask) && test_->flagsStackAddr) {
+            } else if (cpu_.cpuInfo().model == CPUModel::i80386sx && (cpu_.lastExceptionNo() & ExceptionTypeCPU) && test_->flagsStackAddr) {
                 const auto writeIdx = addr - test_->flagsStackAddr;
                 if (writeIdx < 2) {
                     const auto ignore = ignoredFlags_ | (test_->masks ? ~test_->masks->regMask[MOO_RG32_EFLAGS] : 0);

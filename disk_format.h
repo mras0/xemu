@@ -37,9 +37,18 @@ static constexpr DiskFormat diskFormat180K = { 40, 1, 9 }; // 180KB 5.25", 0xFC 
 static constexpr DiskFormat diskFormat360K = { 40, 2, 9 }; // 360KB 5.25", 0xFD media descriptor
 static constexpr DiskFormat diskFormat720K = { 80, 2, 9 }; // 720KB 3.5", 0xF9 media descriptor
 static constexpr DiskFormat diskFormat1440K = { 80, 2, 18 }; // 1440KB 3.5", 0xF0 media descriptor
+static constexpr DiskFormat diskFormat1680K = { 80, 2, 21 }; // 1680KB 3.5", also uses media descriptor
 
 static constexpr DiskFormat diskFormatST157A {
     560, 6, 26 // 43680 KB - SEAGATE: ST157A-1 45MB 3.5"/HH IDE / AT
+};
+
+static constexpr DiskFormat diskFormatST1133A {
+    636, 10, 36 // 114480 KB - SEAGATE: ST1133A 117MB 3.5"/HH IDE / AT
+};
+
+static constexpr DiskFormat diskFormatSL520 {
+    1016, 16, 63, // 512064 KB - SEAGATE: MARATHON 520 524MB 2.5"/SSL ATA2 FAST
 };
 
 const DiskFormat& DiskFormatFromMediaDescriptor(uint8_t mediaDescriptor);

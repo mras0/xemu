@@ -150,6 +150,9 @@ def output_entry(tab, opcode, e):
         # e.g. SMSW is Mw/r16/32/64
         if ops[0] == 'Mw':
             ops[0] = "MwRv"
+        elif ops[1] == 'Mw':
+            # LAR/LSL
+            ops[1] = "MwRv"
 
     if len(ops) > 0 and ops[0][0] == "Z":
         # Z: The instruction has no ModR/M byte; the three least-significant bits of the 

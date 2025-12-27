@@ -264,6 +264,7 @@ private:
     void onCreate()
     {
         HMENU sysMenu = GetSystemMenu(hwnd(), FALSE);
+        AppendMenu(sysMenu, MF_MENUBREAK, 0, nullptr);
         for (int i = 0; i < maxDisks; ++i) {
             HMENU subMenu = CreateMenu();
             AppendMenu(sysMenu, MF_POPUP, (UINT_PTR)subMenu, diskDescriptors[i]);
@@ -337,9 +338,11 @@ private:
         case WM_SYSCOMMAND:
             onSysCommand(LOWORD(wParam));
             break;
+        case WM_SYSKEYDOWN:
         case WM_KEYDOWN:
             keyboard_event(true, static_cast<int>(wParam), static_cast<uint32_t>(lParam));
             break;
+        case WM_SYSKEYUP:
         case WM_KEYUP:
             keyboard_event(false, static_cast<int>(wParam), static_cast<uint32_t>(lParam));
             break;
@@ -416,10 +419,14 @@ std::vector<GUI::Event> GUI::update()
 
 void SetGuiActive(bool active)
 {
-    if (active && hMainWindow)
+    if (active && hMainWindow) {
+        // Wait for return to be released
+        while (GetAsyncKeyState(VK_RETURN) < 0)
+            Sleep(10);
         SetForegroundWindow(hMainWindow);
-    else
+    } else {
         SetForegroundWindow(GetConsoleWindow());
+    }
 }
 
 void DrawScreen(const uint32_t* pixels)

@@ -38,7 +38,7 @@ inline void UpdateU8H(uint64_t& reg, uint8_t value)
     reg = (reg & ~0xff00ULL) | value << 8;
 }
 
-inline void UpdateU16(uint64_t& reg, uint16_t value)
+[[maybe_unused]] inline void UpdateU16(uint64_t& reg, uint16_t value)
 {
     reg = (reg & ~0xffffULL) | value;
 }
@@ -178,13 +178,20 @@ void BiosReplacement::impl::outU16([[maybe_unused]] std::uint16_t port, [[maybe_
         //https://stanislavs.org/helppc/dbt.html
 
         const auto driveNum = GET_REG8L(DX);
-        LOG("INT13h/18 SET MEDIA TYPE FOR FORMAT drive = {:02X}", driveNum);
-        throw std::runtime_error { "TODO: Required for MS-DOS 5 format" };
-        //int13h_setStatus(nullptr, DiskStatus::InvalidParameter); // Not supported
-#if 0
+        LOG("INT13h/18 SET MEDIA TYPE FOR FORMAT drive = {:02X} CX={:04X}", driveNum, GET_REG16(CX));
+#if 1
+        int13h_setStatus(nullptr, DiskStatus::InvalidParameter); // Not supported
+#else
         auto drive = getDrive(driveNum);
         CHECK_DISK_PARAMETER(drive != nullptr);
         CHECK_DISK_PARAMETER(driveNum & 0x80);
+        cpu_.sregs_[SREG_ES] = 0x40;
+        cpu_.sdesc_[SREG_ES].base = cpu_.sregs_[SREG_ES] * 16;
+        const uint32_t physBase = (uint32_t)(cpu_.sdesc_[SREG_ES].base + 0xD0);
+        SET_REG16(DI, static_cast<uint16_t>(physBase & 0xff));
+        uint8_t mediaFormat[11] = "HelloWld!";
+        for (size_t i = 0; i < sizeof(mediaFormat); ++i)
+            bus_.writeU8(physBase + i, mediaFormat[i]);
         int13h_setStatus(drive, DiskStatus::Success);
 #endif
         break;
@@ -195,7 +202,7 @@ void BiosReplacement::impl::outU16([[maybe_unused]] std::uint16_t port, [[maybe_
         LOG("Boot hook");
         if (0) {
             ///const char* filename = "../misc/asmtest/keyboard/test.com";
-            const char* filename = "../test/rom386/test.com";
+            const char* filename = "../misc/asmtest/mode6/test.com";
             LOG("Loading test: {}", filename);
             auto data = ReadFile(filename);
             for (size_t i = 0; i < data.size(); ++i)
@@ -282,19 +289,18 @@ void BiosReplacement::impl::int13h_diskOp(uint8_t op)
 
     LOG("INT13h/{:02X} {} drive = {:02X}, C/H/S {}/{}/{} count={} Dest={:04X}:{:04X}", op, op == 2 ? "Read" : op == 3 ? "Write" : "Verify", driveNum, cylinder, head, sectorNumber, numSectors, seg, ofs);
 
-    if (driveNum == 0xc4) {
-        static bool xx;
-        if (xx)
-            throw std::runtime_error { "FIXME" };
-        xx = true;
-    }
-
     auto drive = getDrive(driveNum);
     CHECK_DISK_PARAMETER(drive != nullptr);
     CHECK_DISK_PARAMETER(drive->diskData.format.validCHS(cylinder, head, sectorNumber));
     const auto srcAddr = drive->diskData.format.toLBA(cylinder, head, sectorNumber) * bytesPerSector;
     const auto byteCount = bytesPerSector * numSectors;
     CHECK_DISK_PARAMETER(srcAddr + byteCount <= drive->diskData.data.size());
+
+    // Note: Verify doesn't actually compare data, it just checks that it was written correctly.
+    if (op == 4) {
+        int13h_setStatus(drive, DiskStatus::Success);
+        return;
+    }
 
     for (uint32_t i = 0; i < byteCount; ++i) {
         const auto addr = (seg * 16) + ((ofs + i) & 0xffff);
@@ -303,13 +309,6 @@ void BiosReplacement::impl::int13h_diskOp(uint8_t op)
             bus_.writeU8(addr, drive->diskData.data[srcAddr + i]);
         } else if (op == 3) {
             drive->diskData.data[srcAddr + i] = bus_.readU8(addr);
-        } else if (op == 4) {
-            if (bus_.readU8(addr) != drive->diskData.data[srcAddr + i]) {
-                LOG("DISK Verify failed");
-                cpu_.regs_[REG_AX] = (cpu_.regs_[REG_AX] & ~0xffULL) | i / bytesPerSector;
-                int13h_setStatus(drive, DiskStatus::VerifyFailed);
-                return;
-            }
         }
     }
 

@@ -7,6 +7,10 @@
 #include <concepts>
 #include <string_view>
 #include <cassert>
+#include <utility>
+
+#define THROW_ONCE() do { static bool passed_before_; if (!passed_before_) { passed_before_ = true; throw std::runtime_error{"FORCE BREAK from " + std::string(__func__) + ":" + std::to_string(__LINE__)}; } } while (0)
+#define THROW_FLIPFLOP() do { static bool flipflop_; if (!std::exchange(flipflop_, !flipflop_)) throw std::runtime_error("FORCED FLIPFLOP BREAK from " + std::string(__func__) + ":" + std::to_string(__LINE__)); } while (0);
 
 std::string FormatXString(std::uint64_t value, size_t width, uint8_t shift);
 
@@ -51,6 +55,30 @@ constexpr std::uint64_t SignExtend(std::uint64_t val, std::uint8_t valSize)
         assert(false);
     }
     return static_cast<uint64_t>(r);
+}
+
+inline uint16_t GetU16(const uint8_t* src)
+{
+    return src[0] | src[1] << 8;
+}
+
+inline uint32_t GetU32(const uint8_t* src)
+{
+    return src[0] | src[1] << 8 | src[2] << 16 | src[3] << 24;
+}
+
+inline void PutU16(uint8_t* dest, uint16_t value)
+{
+    dest[0] = static_cast<uint8_t>(value);
+    dest[1] = static_cast<uint8_t>(value >> 8);
+}
+
+inline void PutU32(uint8_t* dest, uint32_t value)
+{
+    dest[0] = static_cast<uint8_t>(value);
+    dest[1] = static_cast<uint8_t>(value >> 8);
+    dest[2] = static_cast<uint8_t>(value >> 16);
+    dest[3] = static_cast<uint8_t>(value >> 24);
 }
 
 #endif

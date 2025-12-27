@@ -1,5 +1,5 @@
 #include "nec765_floppy_controller.h"
-#include "disk_format.h"
+#include "disk_data.h"
 #include <stdexcept>
 #include <format>
 #include <print>
@@ -133,7 +133,7 @@ class NEC765_FloppyController::impl : public IOHandler, public CycleObserver, pu
 public:
     using OnInterrupt = std::function<void(void)>;
 
-    explicit impl(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart);
+    explicit impl(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart, bool reducedIORange);
 
     void reset();
 
@@ -150,8 +150,13 @@ public:
     void insertDisk(uint8_t drive, const std::vector<uint8_t>& data)
     {
         assert(drive < 4);
-        diskFormat_[drive] = DiskFormatFromBootSector(data);
-        diskData_[drive] = data;
+        diskData_[drive].insert(std::vector<uint8_t>(data));
+    }
+
+    void insertDisk(uint8_t drive, std::string_view filename)
+    {
+        assert(drive < 4);
+        diskData_[drive].insert(filename);
     }
 
 private:
@@ -193,19 +198,17 @@ private:
         uint8_t sector;
         uint16_t sectorOffset;
     } driveState_[4];
-    std::vector<uint8_t> diskData_[4];
-    DiskFormat diskFormat_[4];
+    DiskData diskData_[4] {};
 };
 
-NEC765_FloppyController::impl::impl(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart)
+NEC765_FloppyController::impl::impl(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart, bool reducedIORange)
     : bus_(bus)
     , onInt_(onInt)
     , onDmaStart_(onDmaStart)
 {
-    bus.addIOHandler(0x3f0, 8, *this, true);
+    bus.addIOHandler(0x3f0, reducedIORange ? 6 : 8, *this, true);
     bus.addCycleObserver(*this);
     reset();
-    std::memset(diskFormat_, 0, sizeof(diskFormat_));
 }
 
 void NEC765_FloppyController::impl::reset()
@@ -420,8 +423,9 @@ void NEC765_FloppyController::impl::executeCommand()
         }
         if (commandArgs_[4] != 2 || commandArgs_[7] != 0xff)
             throw std::runtime_error { std::format("Floppy: Unsupported command 0x{:02X} 0b{:b} ({}){} - Invalid sector size/data length", command_, command_, CommandName(command_), argsString) };
-        if (commandArgs_[3] == 0 || commandArgs_[3] > diskFormat_[curDrive_].sectorsPerTrack)
-            throw std::runtime_error { std::format("Floppy: Unsupported command 0x{:02X} 0b{:b} ({}){} - Invalid sector {} (max {})", command_, command_, CommandName(command_), argsString, commandArgs_[3], diskFormat_[curDrive_].sectorsPerTrack) };
+        const auto& fmt = diskData_[curDrive_].format;
+        if (commandArgs_[3] == 0 || commandArgs_[3] > fmt.sectorsPerTrack)
+            throw std::runtime_error { std::format("Floppy: Unsupported command 0x{:02X} 0b{:b} ({}){} - Invalid sector {} (max {})", command_, command_, CommandName(command_), argsString, commandArgs_[3], fmt.sectorsPerTrack) };
         state_ = State::ExecutionPhase;
         dr.sector = commandArgs_[3];
         dr.sectorOffset = 0;
@@ -457,7 +461,7 @@ void NEC765_FloppyController::impl::executeCommand()
     case CMD_SEEK: {
         std::println("Floppy: SEEK {}", argsString);
         state_ = State::ExecutionPhase;
-        auto& fmt = diskFormat_[curDrive_];
+        const auto& fmt = diskData_[curDrive_].format;
         if (((commandArgs_[0] & 4) && fmt.headsPerCylinder < 2) || commandArgs_[1] >= fmt.numCylinder) {
             std::println("Floppy: Unsupported command 0x{:02X} 0b{:b} ({}){} - Invalid seek (disk format {}/{}/{})", command_, command_, CommandName(command_), argsString, fmt.headsPerCylinder, fmt.numCylinder, fmt.sectorsPerTrack);
             commandArgs_[0] &= ~4;
@@ -493,12 +497,12 @@ uint8_t NEC765_FloppyController::impl::dmaGetU8()
     auto& dr = driveState_[curDrive_];
 
 
-    auto& fmt = diskFormat_[curDrive_];
+    const auto& fmt = diskData_[curDrive_].format;
 
     if (!fmt.validCHS(dr.cylinder, dr.head, dr.sector))
         throw std::runtime_error { std::format("Floppy: Read outside disk area {}/{}/{} (format {}/{}/{})", dr.head, dr.cylinder, dr.sector, fmt.headsPerCylinder, fmt.numCylinder, fmt.sectorsPerTrack) };
 
-    const uint8_t data = diskData_[curDrive_][fmt.toLBA(dr.cylinder, dr.head, dr.sector) * bytesPerSector + dr.sectorOffset];
+    const uint8_t data = diskData_[curDrive_].data[fmt.toLBA(dr.cylinder, dr.head, dr.sector) * bytesPerSector + dr.sectorOffset];
     //std::println("Floppy: Reading {}/{}/{} offset {} - {:02x}", dr.cylinder, dr.head, dr.sector, dr.sectorOffset, data);
 
     if (++dr.sectorOffset == bytesPerSector) {
@@ -532,8 +536,8 @@ void NEC765_FloppyController::impl::dmaDone()
     raiseIRQ();
 }
 
-NEC765_FloppyController::NEC765_FloppyController(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart)
-    : impl_ { std::make_unique<impl>(bus, onInt, onDmaStart) }
+NEC765_FloppyController::NEC765_FloppyController(SystemBus& bus, const OnInterrupt& onInt, const OnDmaStart& onDmaStart, bool reducedIORange)
+    : impl_ { std::make_unique<impl>(bus, onInt, onDmaStart, reducedIORange) }
 {
 }
 
@@ -542,4 +546,9 @@ NEC765_FloppyController::~NEC765_FloppyController() = default;
 void NEC765_FloppyController::insertDisk(uint8_t drive, const std::vector<uint8_t>& data)
 {
     impl_->insertDisk(drive, data);
+}
+
+void NEC765_FloppyController::insertDisk(uint8_t drive, std::string_view filename)
+{
+    impl_->insertDisk(drive, filename);
 }

@@ -53,14 +53,21 @@ CPUException::CPUException(CPUExceptionNumber exceptionNo, std::uint32_t errorCo
 
 std::string FormatExceptionNumber(int exceptionNo)
 {
-    assert(exceptionNo >= 0 && exceptionNo < (0x100 | CPUExceptionNumber::ExceptionMax));
-    if (exceptionNo & ExceptionHardwareMask) {
-        const auto no = exceptionNo & ExceptionNumberMask; 
-        if (no < ExceptionMax)
-            return std::format("Exception {} {} {}", no, CPUExceptionNumberShortText[no], CPUExceptionNumberText[no]);
-        else
-            return std::format("Exception {}", no);
-    } else {
-        return std::format("Interrupt 0x{:02X}", exceptionNo);
+    //static constexpr int ExceptionTypeSW = 0 << ExceptionTypeShift;
+    //static constexpr int ExceptionTypeCPU = 1 << ExceptionTypeShift;
+    //static constexpr int ExceptionTypeHW = 2 << ExceptionTypeShift;
+
+    const auto no = exceptionNo & ExceptionNumberMask;
+    switch (exceptionNo & ExceptionTypeMask) {
+    case ExceptionTypeSW:
+        return std::format("Interrupt 0x{:02X}", no);
+        break;
+    case ExceptionTypeCPU:
+        assert(no < ExceptionMax);
+        return std::format("Exception 0x{:02X} {} {}", no, CPUExceptionNumberShortText[no], CPUExceptionNumberText[no]);
+    case ExceptionTypeHW:
+        return std::format("Hardware interrupt 0x{:02X}", no);
+    default:
+        return std::format("Unknown exception 0x{:04X}", exceptionNo);
     }
 }

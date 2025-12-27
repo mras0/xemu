@@ -58,7 +58,6 @@ enum class OperandMode {
     Mp,
     Mptp,
     Ms,
-    Mw,
     MwRv,
     Ob,
     Ov,

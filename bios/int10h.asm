@@ -1,4 +1,32 @@
+%macro CHECK_PAGE 1
+        cmp     %1,7
+        ja      FatalError
+%endmacro
+
+%macro  IS_TEXT_MODE 0
+        cmp     byte [bda_videoMode],3
+%endmacro
+
+%macro CHECK_MODE 0
+        IS_TEXT_MODE
+        jne     FatalError
+%endmacro
+
+%macro CURSOR_POS_OFS 0 ; bx = bh*2
+        CHECK_PAGE bh
+        xor     bl,bl
+        xchg    bh,bl
+        add     bl,bl
+%endmacro
+
 Int10h_VideoInt:
+.ok:
+        ; VIDEO - MSHERC.COM - GET VIDEO ADAPTER TYPE AND MODE
+        cmp     ah,0xEF
+        je      .ignore_early
+        ; EGA Register Interface Library - INTERROGATE DRIVER
+        cmp     ah,0xFA
+        je      .ignore_early
         sti
         PUSH_ALL
         cmp     ah,(.dispatchEnd-.dispatch)/2
@@ -31,6 +59,7 @@ Int10h_VideoInt:
 ;;;;;;;;;;;;
 
         POP_ALL
+.ignore_early:
         iret
 .oob:
         jmp     FatalError ; For now
@@ -53,7 +82,7 @@ Int10h_VideoInt:
         dw      .oob                            ; 0Dh
         dw      Int10h_0E_TTYOut                ; 0Eh
         dw      Int10h_0F_GetMode               ; 0Fh
-        dw      .oob                            ; 10h
+        dw      .ignore                         ; 10h VGA functions
         dw      .ignore                         ; 11h VGA functions (AX=1104h used by FreeDOS)
         dw      .ignore                         ; 12h Used for EGA detection
         dw      .oob                            ; 13h
@@ -63,8 +92,8 @@ Int10h_VideoInt:
         dw      .oob                            ; 17h
         dw      .oob                            ; 18h
         dw      .oob                            ; 19h
-        dw      .ignore                         ; 1Ah (GET DISPLAY COMBINATION CODE (PS,VGA/MCGA))
-        dw      .oob                            ; 1Bh
+        dw      .ignore                         ; 1Ah GET DISPLAY COMBINATION CODE (PS,VGA/MCGA)
+        dw      .ignore                         ; 1Bh FUNCTIONALITY/STATE INFORMATION (PS,VGA/MCGA)
         dw      .oob                            ; 1Ch
         dw      .oob                            ; 1Dh
         dw      .oob                            ; 1Eh
@@ -78,19 +107,42 @@ CGA_PORT_CSEL EQU 0x3D9
 
 CGA_ROWS EQU 25
 CGA_SEGMENT EQU 0xB800
+CGA_MEM_SIZE EQU 16384
 VIDEO_CLEAR_WORD EQU 0x0720
 
 CGA_Mode3_80x25_data:
         db 0x71, 0x50, 0x5A, 0x0A, 0x1F, 0x06, 0x19, 0x1C, 0x02, 0x07, 0x06, 0x07, 0x00, 0x00
 
+CGA_Mode6_640x200_data:
+        db 0x38, 0x28, 0x2D, 0x0A, 0x7F, 0x06, 0x64, 0x70, 0x02, 0x01, 0x06, 0x07, 0x00, 0x00
+
 Int10h_00_SetMode:
-        ; Only support mode 3 for now
         cmp     al,3
-        jne     FatalError
+        je      .mode3
+        cmp     al,6
+        je      .mode6
+        jmp     FatalError
+.mode3:
+        mov     ah,80
+        mov     si,CGA_Mode3_80x25_data
+        mov     bx,1<<0|1<<5 ; 80x25 text
+        jmp     .gotmode
+.mode6:
+        mov     ah,80
+        mov     si,CGA_Mode6_640x200_data
+        mov     bx,0xf<<8|1<<1|1<<2|1<<4 ; 640x200 graphics (B&W), white, intense foreground color
+        jmp     .gotmode
+.gotmode:
 
         mov     BYTE [bda_videoMode],al
-        mov     WORD [bda_videoColumns],80
-        mov     WORD [bda_videoPageSize],80*CGA_ROWS*2
+        mov     BYTE [bda_videoColumns],ah
+        mov     BYTE [bda_videoColumns+1],0
+        mov     ax,0x1000
+        cmp     ah,80
+        je      .set_page_size
+        mov     ax,0x0800
+.set_page_size:
+        mov     [bda_videoPageSize],ax ; 4K for 80*25 and 2K for 40*25
         mov     BYTE [bda_videoCurrentPage],0
         mov     BYTE [bda_videoCharRows], CGA_ROWS-1 ; Used by FreeDOS...
 
@@ -102,15 +154,19 @@ Int10h_00_SetMode:
         xor     ax,ax
         rep     stosw
 
-        ; Clear screen
+        ; Clear video mem
         mov     ax,CGA_SEGMENT
         mov     es,ax
         xor     di,di
+
+        xor     ax,ax
+        IS_TEXT_MODE
+        jnz     .goclear
         mov     ax,VIDEO_CLEAR_WORD
-        mov     cx,80*CGA_ROWS
+.goclear:
+        mov     cx,CGA_MEM_SIZE/2
         rep     stosw
 
-        mov     si,CGA_Mode3_80x25_data
         xor     ah,ah
 .setmode:
         cs lodsb
@@ -120,10 +176,11 @@ Int10h_00_SetMode:
         jne     .setmode
 
         mov     dx,CGA_PORT_CSEL
-        xor     al,al
+        mov     al,bh
         out     dx,al
         mov     dx,CGA_PORT_MODE
-        mov     al, 1|1<<3|1<<5 ; 80x25
+        mov     al,bl
+        or      al,1<<3 ; Enable video signal
         out     dx,al
 
         call    Video_SetCursor
@@ -131,7 +188,8 @@ Int10h_00_SetMode:
         mov     cx,0x0607
         call    Int10h_01_SetCursorShape
 
-        ret
+        xor     al,al
+        jmp     Video_SetPage
 
 Int10h_01_SetCursorShape: ; CX
         mov     WORD [bda_videoCursorType],cx
@@ -143,28 +201,37 @@ Int10h_01_SetCursorShape: ; CX
         call    Video_SetReg
         ret
 
-Int10h_02_SetCursorPos: ; Row= DH, col = DL, TODO: Page (= BH)
-        cmp     bh, 0
-        jne     FatalError
-        mov     [bda_videoCursorPos],dx
-        call    Video_SetCursor
+Int10h_02_SetCursorPos: ; Row= DH, col = DL, Page (= BH)
+        mov     al,bh
+        CURSOR_POS_OFS
+        mov     [bda_videoCursorPos+bx],dx
+        cmp     [bda_videoCurrentPage],al
+        je      Video_SetCursor
         ret
 
 Int10h_03_GetCursorPos: ; Page (= BH)
-        cmp     bh, 0
-        jne     FatalError
+        ;CURSOR_POS_OFS
         mov     cx,[bda_videoCursorType]
-        mov     dx,[bda_videoCursorPos]
+        mov     dx,[bda_videoCursorPos+bx]
         mov     bp, sp
         mov     [bp+isf_CX],cx
         mov     [bp+isf_DX],dx
         ret
 
 Int10h_05_SetPage: ; AL=page number
+        CHECK_MODE
+        CHECK_PAGE al
+Video_SetPage:
         mov     [bda_videoCurrentPage],al
-        test    al,al
-        jne     FatalError ; TODO
-        ret
+        xor     ah,ah
+        mul     word [bda_videoPageSize]
+        mov     bh,ah
+        mov     ah,0x0D
+        call    Video_SetReg
+        dec     ah
+        mov     al,bh
+        call    Video_SetReg
+        jmp     Video_SetCursor
 
 ;
 ; Window scroling
@@ -206,6 +273,10 @@ Int10h_07_ScrollWindowDown:
 ;       BP = 2 * bda_videoColumns
 ;       DS = ES = Video segment
 Video_ScrollWindowSetup:
+        cmp     byte [bda_videoCurrentPage],0
+        jne     FatalError ; TODO
+        CHECK_MODE
+
         mov     bl,al   ; bl
         mov     bp,[bda_videoColumns]
         mov     ax,bp
@@ -273,11 +344,9 @@ Video_ClearWindow:
         ret
 
 
-Int10h_08_ReadChar: ; BH = page(TODO)
-        cmp     bh, 0
-        jne     FatalError
+Int10h_08_ReadChar: ; BH = page
+        CHECK_MODE
         call    Video_CursorOffset
-        add     bx,bx
         mov     ax,CGA_SEGMENT
         mov     es,ax
         mov     ax,[es:bx]
@@ -285,23 +354,19 @@ Int10h_08_ReadChar: ; BH = page(TODO)
         mov     [bp+isf_AX],ax
         ret
 
-Int10h_09_WriteCharAttr: ; AL = char, BH = page (TODO), BL = Attribute, CX = count
-        cmp     bh, 0
-        jne     FatalError
+Int10h_09_WriteCharAttr: ; AL = char, BH = page, BL = Attribute, CX = count
+        CHECK_MODE
         mov     ah,bl
         call    Video_CursorOffset
-        add     bx,bx
         mov     di,bx
         mov     bx,CGA_SEGMENT
         mov     es,bx
         rep     stosw
         ret
 
-Int10h_0A_WriteCharOnly: ; AL = char, BH = page (TODO), BL = Attribute, CX = count
-        cmp     bh, 0
-        jne     FatalError
+Int10h_0A_WriteCharOnly: ; AL = char, BH = page, BL = Attribute, CX = count
+        CHECK_MODE
         call    Video_CursorOffset
-        add     bx,bx
         mov     di,bx
         mov     bx,CGA_SEGMENT
         mov     es,bx
@@ -313,10 +378,14 @@ Int10h_0A_WriteCharOnly: ; AL = char, BH = page (TODO), BL = Attribute, CX = cou
         ret
 
 Int10h_0E_TTYOut: ; AL = character, BL = color
+        CHECK_MODE
         mov     bh,[bda_videoCurrentPage] ; IBM PC BIOS always writes to current page
 
-        cmp     bh, 0
-        jne     FatalError
+        push    bx
+        CURSOR_POS_OFS
+        mov     si,bx
+        add     si,bda_videoCursorPos   ; si = cursor position
+        pop     bx
 
         cmp     al,0x07
         je      .bell
@@ -328,45 +397,47 @@ Int10h_0E_TTYOut: ; AL = character, BL = color
         je      .cr
 
         call    Video_CursorOffset
-        add     bx,bx
         mov     dx,CGA_SEGMENT
         mov     es,dx
         mov     [es:bx],al
 
-        mov     al,[bda_videoCursorPos]
+        mov     al,[si]
         inc     al
         cmp     al,[bda_videoColumns]
         jb      .out
-        mov     BYTE [bda_videoCursorPos],0
+        mov     BYTE [si],0
         jmp     .lf
 
 .out:   ; AL = cursor X
-        mov     [bda_videoCursorPos],al
+        mov     [si],al
 .outCursor:
-        call    Video_SetCursor
-        ret
+        jmp     Video_SetCursor
 .bell:
         ; TODO
         jmp     .out
 .bs:
-        mov     al, [bda_videoCursorPos]
+        mov     al,[si]
         dec     al
         js      .bell
         jmp     .out
 .lf:
-        inc     BYTE [bda_videoCursorPos+1]
-        cmp     BYTE [bda_videoCursorPos+1],CGA_ROWS-1
+        inc     BYTE [si+1]
+        cmp     BYTE [si+1],CGA_ROWS-1
         jbe     .outCursor
-        mov     BYTE [bda_videoCursorPos+1],CGA_ROWS-1
+        mov     BYTE [si+1],CGA_ROWS-1
         ; Scroll window (TODO: Use AH=06h)
+        mov     ax,ax
+        mov     al,[bda_videoCurrentPage]
+        mul     WORD [bda_videoPageSize]
+        mov     di,ax
         mov     ax,[bda_videoColumns]
         mov     bx,CGA_SEGMENT
         mov     es,bx
         push    ds
         mov     ds,bx
-        xor     di,di
         mov     si,ax
         add     si,si                           ; si = 2*columns
+        add     si,di
         mov     ah,CGA_ROWS-1
         mul     ah                              ; ax = (rows-1)*columns
         mov     cx,ax
@@ -390,18 +461,40 @@ Int10h_0F_GetMode:
         mov     [bp+isf_BX+1],bh
         ret
 
-Video_CursorOffset: ; BX <- CursorY*bda_videoColumns+CursorX
+Video_CursorOffset: ; BX <- CursorY*bda_videoColumns+CursorX+BH*bda_videoPageSize
+        CHECK_PAGE bh
         push    ax
-        mov     ax,[bda_videoColumns]
-        mul     BYTE [bda_videoCursorPos+1]
-        xor     bx,bx
-        mov     bl,BYTE [bda_videoCursorPos]
-        add     bx,ax
+        push    dx
+        push    si
+        xor     ax,ax
+        mov     al,bh
+        mul     WORD [bda_videoPageSize]
+        mov     si,ax
+        CURSOR_POS_OFS
+        mov     al,[bda_videoColumns]
+        mul     BYTE [bx+bda_videoCursorPos+1]
+        add     ax,ax
+        add     si,ax
+        xor     ax,ax
+        mov     al,BYTE [bx+bda_videoCursorPos]
+        add     ax,ax
+        add     ax,si
+        mov     bx,ax
+        pop     si
+        pop     dx
         pop     ax
         ret
 
-Video_SetCursor: ; TODO: Page
-        call    Video_CursorOffset
+Video_SetCursor:
+        mov     bl,[bda_videoCurrentPage]
+        add     bl,bl
+        xor     bh,bh
+        mov     al,[bx+bda_videoCursorPos+1]
+        mul     BYTE [bda_videoColumns]
+        mov     bl,[bx+bda_videoCursorPos]
+        xor     bh,bh
+        add     bx,ax
+
         mov     ah,0x0E
         mov     al,bh
         call    Video_SetReg

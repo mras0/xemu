@@ -11,13 +11,17 @@
 #include "debugger.h"
 #include "gui.h"
 #include "devs/cga.h"
+#include "devs/vga.h"
 #include "devs/i8259a_pic.h"
 #include "devs/i8253_pit.h"
 #include "devs/nec765_floppy_controller.h"
 #include "devs/i8237a_dma_controller.h"
 #include "devs/i8042_ps2_controller.h"
+#include "devs/ata_controller.h"
 #include "bios_replacement.h"
 #include "disk_data.h"
+
+#define USE_EGA
 
 class XTPPI : public IOHandler, public CycleObserver {
 public:
@@ -470,18 +474,21 @@ public:
         : bus_ { bus }
     {
         bus.addIOHandler(0x92, 1, *this);
+        setState(false);
+    }
+
+    uint8_t inU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        return fastA20_ ? PORTA_MASK_A20 : 0;
+    }
+
+    void outU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
+    {
+        //std::println("Output to fast A20 port: {:02X}", value);
+        if (value & ~PORTA_MASK_A20)
+            throw std::runtime_error { std::format("Unsupported value written to port 0x92 (Fast A20): {:02X}", value) };
+        fastA20_ = (value & PORTA_MASK_A20) != 0;
         setA20State();
-    }
-
-    uint8_t inU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
-    {
-        return IOHandler::inU8(port, offset);
-    }
-
-    void outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
-    {
-        std::println("Output to fast A20 port: {:02X}", value);
-        IOHandler::outU8(port, offset, value);
     }
 
     void setKbdA20Line(bool value)
@@ -491,18 +498,26 @@ public:
     }
 
 private:
+    static constexpr uint8_t PORTA_MASK_A20 = 1 << 1;
+
     SystemBus& bus_;
-    bool prevState_ = false;
+    bool curState_ = false;
     bool kbdA20Line_ = false;
+    bool fastA20_ = false;
+
+    void setState(bool enabled)
+    {
+        //std::println("A20 gate {}!", enabled ? "enabled" : "disabled");
+        bus_.setAddressMask(UINT64_MAX & ~(enabled ? 0 : 1 << 20));
+        curState_ = enabled;
+    }
+
 
     void setA20State()
     {
-        const bool enabled = kbdA20Line_;
-        if (enabled != prevState_) {
-            std::println("A20 gate {}!", enabled ? "enabled" : "disabled");
-            bus_.setAddressMask(UINT64_MAX & ~(enabled ? 0 : 1 << 20));
-        }
-        prevState_ = enabled;
+        const bool enabled = kbdA20Line_ || fastA20_;
+        if (enabled != curState_)
+            setState(enabled);
     }
 };
 
@@ -510,11 +525,12 @@ class Clone386Machine : public BaseMachine, public IOHandler {
 public:
     explicit Clone386Machine()
         : BaseMachine { CPUModel::i80386sx }
+        , extendedMem { 15 * 1024 * 1024 }
         , a20control { bus }
         , cmos { bus }
         , dma1 { bus, 0x00, 0x81, false }
         , dma2 { bus, 0xC0, 0x89, true }
-        , cga { bus }
+        , video { bus }
         , pic1 { bus, 0x20 }
         , pic2 { bus, 0xA0 }
         , pit { bus,
@@ -539,9 +555,11 @@ public:
                 (void)isPut;
                 dma1.startGet(DMA_CHANNEL_FLOPPY, handler);
             },
-        } , extendedMem {
-            3 * 1024 * 1024
+            true, // ATA needs ports 0x3f6/0x3f7
         }
+        , ata1 { bus, 0x1f0, 0x3f6, []() {
+                    throw std::runtime_error { "TODO: ATA1 IRQ!" };
+                } }
     {
         bus.setDefaultIOHandler(this);
         cpu.setInterruptFunction([this]() { return pic1.getInterrupt(); });
@@ -549,21 +567,27 @@ public:
         bus.addMemHandler(1024 * 1024, extendedMem.size(), extendedMem);
     }
 
+    RamHandler extendedMem;
     A20Control a20control;
     CMOS cmos;
     i8237a_DMAController dma1;
     i8237a_DMAController dma2;
-    CGA cga;
+#ifdef USE_EGA
+    VGA video;
+#else
+    CGA video;
+#endif
     i8259a_PIC pic1;
     i8259a_PIC pic2;
     i8253_PIT pit;
     i8042_PS2Controller ps2;
     NEC765_FloppyController floppy;
-    RamHandler extendedMem;
+    ATAController ata1;
+    std::string serialData;
 
     void forceRedraw() override
     {
-        cga.forceRedraw();
+        video.forceRedraw();
     }
 
     void keyboardEvent(const KeyPress& key) override
@@ -575,6 +599,25 @@ public:
     {
         if (isCommPort(port) || isATAPort(port))
             return 0xFF;
+
+        if (port == 0x201) // Game port
+            return 0xFF;
+
+        if (port == 0x1CF) // SEA bios
+            return 0xFF;
+
+        if (port == 0xA20 || port == 0xA24) { // ??? Power management? (Win3.1)
+            std::println("Ignoring read from port {:04X}", port);
+            return 0xFF;
+        }
+
+
+        // Win3.1 install ?? 0x23x is BUS mouse
+        // 3BA MDA
+        if ((port >= 0x238 && port <= 0x23F) || port == 0x3BA || port >= 0x1000) {
+            std::println("Ignoring read from port {:04X}", port);
+            return 0xFF;
+        }
 
         return IOHandler::inU8(port, offset);
     }
@@ -589,8 +632,19 @@ public:
 
     void outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
     {
-        if (port != 0x3f8) // Serial data port
-            std::println("Ignoring write to port {:02X} value {:02X}", port, value);
+        if ((port & 0x3f8) == 0x3f8) {
+            // Serial port
+            if (port == 0x3f8) {
+                if (value != 0x0C) // Sent by windows debug build
+                    serialData += value;
+                if (value == '\n') {
+                    std::println("Serial data: {:?}", serialData);
+                    serialData.clear();
+                }
+            }
+            return;
+        }
+        std::println("Ignoring write to port {:02X} value {:02X}", port, value);
         if (isCommPort(port) || isATAPort(port))
             return;
 
@@ -622,8 +676,21 @@ void StretchImage(uint32_t* dst, int dstW, int dstH, const uint32_t* src, int sr
 
     const auto xScale = (double)dstW / srcW;
     const auto yScale = (double)dstH / srcH;
-    if ((xScale != 1 && xScale != 2) || yScale != 2)
-        throw std::runtime_error { std::format("TODO: StretchImage scale = {}x{}", (double)dstW / srcW, (double)dstH / srcH) };
+    if ((xScale != 1 && xScale != 2) || yScale != 2) {
+        int32_t dudx = (srcW << 16) / dstW, dvdy = (srcH << 16) / dstH;
+
+        int32_t v = 0;
+        for (int y = 0; y < dstH; ++y) {
+            int32_t u = 0;
+            for (int x = 0; x < dstW; ++x) {
+                dst[x + y * dstW] = src[(u >> 16) + (v >> 16) * srcW];
+                u += dudx;
+            }
+            v += dvdy;
+        }
+
+        return;
+    }
 
     for (int y = 0; y < dstH; ++y) {
         for (int x = 0; x < dstW; ++x) {
@@ -641,8 +708,8 @@ int main()
         extern void TestDebugger();
         TestDebugger();
 
-        const int guiWidth = 640;
-        const int guiHeight = 400;
+        const int guiWidth = 800;
+        const int guiHeight = 600;
 
         GUI gui { guiWidth, guiHeight };
         SetGuiActive(true);
@@ -653,46 +720,78 @@ int main()
             throw std::runtime_error { std::format("No support for disk insertion in drive {:02X} {:?}", drive, filename) };
         };
 
-#if 1
         Clone386Machine machine;
-        machine.cga.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
+        machine.video.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
+            if (!pixels) {
+                // No sync
+                for (int y = 0; y < guiHeight; ++y) {
+                    for (int x = 0; x < guiWidth; ++x) {
+                        screenBuffer[x + y * guiWidth] = ((x >> 2) ^ (y >> 2)) & 1 ? 0x555555 : 0x111111;
+                    }
+                }
+                DrawScreen(screenBuffer.data());
+                return;
+            }
             StretchImage(&screenBuffer[0], guiWidth, guiHeight, pixels, w, h);
             DrawScreen(screenBuffer.data());
         });
 
-        const char* diskName = "../misc/SW/FreeDos/x86BOOT.img";
+        const char* diskName = "../misc/asmtest/egagfx/test.img";
        
-        BiosReplacement bios { machine.cpu, machine.bus };
         try {
-            CreateDisk("hd.bin", diskFormatST157A);
+            CreateDisk("hd.bin", diskFormatSL520);
             std::println("Created HD");
-        } catch (...){}
+        } catch (...) {
+        }
+#ifdef USE_EGA
+        auto videoRomData = ReadFile(R"(../misc/ega/ega.rom)");
+        //auto videoRomData = ReadFile(R"(c:\Tools\bochs-2.7\bios\VGABIOS-lgpl-latest)");
+#else
+        auto videoRomData = ReadFile(R"(bios/videobios.bin)");
+#endif
+        auto videoRom = RomHandler { videoRomData };
+        machine.bus.addMemHandler(0xC0000, videoRom.size(), videoRom);
 
-        (void)diskName;
-        //bios.insertDisk(0, diskName);
-        bios.insertDisk(0x80, "hd.bin");
+        auto rom = RomHandler { ReadFile(R"(c:\Tools\bochs-2.7\bios\BIOS-bochs-legacy)") };
+        BochsDebugHandler bochsDbgHandler { machine.bus };
+        PCIHandler pciHandler { machine.bus };
+        machine.cmos.set(0x10, 0x44); // 2x1.44MB floppy drives
+
+        assert(machine.extendedMem.size() < 16ULL * 1024 * 1024); // TODO: CMOS 0x34/0x35 Extended Mem size in 64K blocks > 16MB
+        const auto extMemSize = std::min(size_t(63 * 1024), machine.extendedMem.size() >> 10); // In KB
+        machine.cmos.set(0x30, static_cast<uint8_t>(extMemSize & 0xff));
+        machine.cmos.set(0x31, static_cast<uint8_t>(extMemSize >> 8)); 
+
+
+        //machine.cmos.set(0x3D, 0x01); // Boot from floppy
+        machine.floppy.insertDisk(0, ReadFile(diskName));
+        ////machine.cmos.set(0x3D, 0x21); // Boot from floppy then HD
+        machine.cmos.set(0x3D, 0x02); // Boot from HD
+        machine.ata1.insertDisk(0, "hd.bin");
+        //machine.ata1.insertDisk(0, "win2.bin");
+        //machine.ata1.insertDisk(0, "freedos.bin");
+        
+        machine.bus.addMemHandler(0x100000 - rom.size(), rom.size(), rom);
+
+
+        // Ignore unmapped ROM area
+        struct IgnoredHandler : public MemoryHandler {
+            IgnoredHandler(SystemBus& bus, uint64_t start, uint64_t end) { bus.addMemHandler(start, end - start, *this); }
+            std::uint8_t readU8([[maybe_unused]] std::uint64_t addr, [[maybe_unused]] std::uint64_t offset) override { return 0xFF; }
+            void writeU8([[maybe_unused]] std::uint64_t addr, [[maybe_unused]] std::uint64_t offset, [[maybe_unused]] std::uint8_t value) override { }
+        } ignoredHandler {machine.bus, 0xC0000+videoRom.size(), 0x100000 - rom.size() };
 
         diskInsertionEvent = [&](uint8_t drive, std::string_view filename) {
-            if (!filename.empty())
+            if (!filename.empty()) {
                 std::println("Inserting in drive {:02X}: {:?}", drive, filename);
-            else
+                machine.floppy.insertDisk(drive, ReadFile(std::string(filename)));
+            } else {
                 std::println("Ejecting disk in drive {:02X}", drive, filename);
-            bios.insertDisk(drive, filename);
+                machine.floppy.insertDisk(drive, filename);
+
+            }
         };
-#else
-        XTMachine machine {};
-        auto& bus = machine.bus;
 
-        auto rom = RomHandler { ReadFile("../misc/GLABIOS/GLABIOS_0.4.1_8X.ROM") };
-        bus.addMemHandler(0x100000 - rom.size(), rom.size(), rom);
-        machine.cga.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
-            StretchImage(&screenBuffer[0], guiWidth, guiHeight, pixels, w, h);
-            DrawScreen(screenBuffer.data());
-        });
-
-        auto& floppy = machine.floppy;
-        floppy.insertDisk(0, ReadFile(R"(../misc/sw/swar.img)"));
-#endif
         Debugger dbg { machine.cpu, machine.bus };
         auto& cpu = machine.cpu;
 
@@ -720,9 +819,16 @@ int main()
                 machine.forceRedraw();
             SetGuiActive(!active);
         });
+        machine.video.registerDebugFunction(dbg);
 
         //dbg.activate();
-        //dbg.addBreakPoint((0xf000 << 4) + 0x9CBF);
+        //dbg.addBreakPoint((0xC000 << 4) + 0x448); // POD14_ERR
+        //dbg.addBreakPoint((0xC000 << 4) + 0x4E0); // "HOW_BIG"
+        //dbg.addBreakPoint((0xC000 << 4) + 0x630);
+        //dbg.addBreakPoint((0xC000 << 4) + 0x660); // PODSTG_ERR0
+        //dbg.addBreakPoint((0xC000 << 4) + 0x5c3);
+
+        //machine.cpu.exceptionTraceMask(0);
 
         bool quit = false;
         for (unsigned guiUpdateCnt = 0; !quit;) {

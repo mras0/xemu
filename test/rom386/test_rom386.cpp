@@ -64,6 +64,8 @@ public:
             debugBreak = true;
             break;
         case 0x400: // Used by test
+        case 0x4FE:
+        case 0x4FF:
             return;
         case 0x21: // interrupt mask registers
         case 0xA1:
@@ -110,7 +112,7 @@ int main()
             } catch (const std::exception& e) {
                 const char* const sep = "---------------------------------------------------";
                 std::println("{}", sep);
-                cpu.showHistory();
+                cpu.showHistory(10);
                 std::println("");
                 cpu.trace();
                 std::println("");

@@ -9,6 +9,10 @@
 #include <cstring>
 #include "util.h"
 
+
+// The system clock frequency is 4*f and the XT CPU runs at 4*f/3 where f is the NTSC clock freuency
+static constexpr uint32_t SysClockFreqHz = 14318180; // 3.579545Mhz * 4
+
 class BusDevice {
     virtual ~BusDevice() { }
 
@@ -158,6 +162,8 @@ public:
 class SystemBus {
 public:
     explicit SystemBus() {}
+    SystemBus(const SystemBus&) = delete;
+    SystemBus& operator=(const SystemBus&) = delete;
 
     void addMemHandler(std::uint64_t base, std::uint64_t length, MemoryHandler& handler, bool needSync = false)
     {

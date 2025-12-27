@@ -746,8 +746,8 @@ static const Instruction ITable_0F_BA[8] = {
 const Instruction InstructionTable_0F_80386[256] = {
     { .mnemonic = InstructionMnem::TABLE, .table = ITable_0F_00 }, // 0F 00
     { .mnemonic = InstructionMnem::TABLE, .table = ITable_0F_01 }, // 0F 01
-    { InstructionMnem::LAR, { OperandMode::Gv, OperandMode::Mw } }, // 02
-    { InstructionMnem::LSL, { OperandMode::Gv, OperandMode::Mw } }, // 03
+    { InstructionMnem::LAR, { OperandMode::Gv, OperandMode::MwRv } }, // 02
+    { InstructionMnem::LSL, { OperandMode::Gv, OperandMode::MwRv } }, // 03
     { InstructionMnem::UNDEF }, // 04
     { InstructionMnem::LOADALL }, // 05
     { InstructionMnem::CLTS }, // 06

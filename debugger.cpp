@@ -219,12 +219,6 @@ void InstallBreakHandler(void)
     signal(SIGINT, &BreakHandler);
 }
 
-uint64_t GetPhysicalIp(const CPUState& st)
-{
-    assert(!st.protectedMode()); // TODO
-    return st.sregs_[SREG_CS] * 16 + st.ip_;
-}
-
 } // unnamed namespace
 
 
@@ -642,11 +636,12 @@ Debugger::Debugger(CPU& cpu, SystemBus& bus)
     InstallBreakHandler();
 }
 
+
 void Debugger::initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset)
 {
     assert(static_cast<uint32_t>(sr) <= 6);
     ms.sr = sr;
-    ms.address = Address { cpu_.sregs_[sr], offset, static_cast<uint8_t>(cpu_.protectedMode() ? 4 : 2) };
+    ms.address = Address { cpu_.sregs_[sr], offset, static_cast<uint8_t>(cpu_.protectedMode() && !cpu_.vm86() ? 4 : 2) };
 }
 
 uint64_t Debugger::toPhys(uint64_t linearAddress)
@@ -659,7 +654,7 @@ uint64_t Debugger::toPhys(uint64_t linearAddress)
     const auto pte = peekMem((pde & PT32_MASK_ADDR) + ((linearAddress >> 12) & 1023) * 4, 4);
     if (!(pte & PT32_MASK_P))
         throw std::runtime_error { std::format("{:08X} not present in PT", linearAddress) };
-    return (pte & PT32_MASK_P) + (linearAddress & PAGE_MASK);
+    return (pte & PT32_MASK_ADDR) + (linearAddress & PAGE_MASK);
 }
 
 uint64_t Debugger::toPhys(const DebuggerMemState& ms, uint64_t offset)
@@ -669,8 +664,12 @@ uint64_t Debugger::toPhys(const DebuggerMemState& ms, uint64_t offset)
     if (ms.sr != SREG_INVALID)
         return toPhys(cpu_.sdesc_[ms.sr].base + offset);
 
-    if (cpu_.protectedMode()) {
-        std::println("WARNING: Protected mode enabled and sr is invalid!");
+    if (cpu_.protectedMode() && !cpu_.vm86()) {
+        const auto sel = a.segment();
+        const auto desc = SegmentDescriptor::fromU64(peekDescriptor(sel));
+        if (!desc.present() || !(desc.access & SD_ACCESS_MASK_S))
+            throw std::runtime_error { std::format("Descriptor {:04X} not supported: {}", sel, desc) };
+        return toPhys(desc.base + offset);
     }
 
     return toPhys(a.segment() * 16 + offset);
@@ -681,7 +680,7 @@ void Debugger::activate()
     if (!active_) {
         active_ = true;
         traceCount_ = 0;
-        autoBreakPoint_.active = false;
+        autoBreakPoint_.type = BreakPoint::Type::INACTIVE;
         initMemState(disAsmAddr_, SREG_CS, cpu_.ip_);
         if (onSetActive_)
             onSetActive_(true);
@@ -690,11 +689,18 @@ void Debugger::activate()
 
 bool Debugger::checkBreakPoint(const BreakPoint& bp)
 {
-    if (!bp.active)
+    switch (bp.type) {
+    case BreakPoint::Type::INACTIVE:
         return false;
-    assert(!cpu_.protectedMode()); // TODO
-    if (GetPhysicalIp(cpu_) != bp.phys)
-        return false;
+    case BreakPoint::Type::PHYSICAL:
+        if (getPhysicalIp(cpu_) != bp.address)
+            return false;
+        break;
+    case BreakPoint::Type::LOGICAL:
+        if (cpu_.sregs_[SREG_CS] != bp.seg || cpu_.ip_ != bp.address)
+            return false;
+        break;
+    }
     activate();
     return true;
 }
@@ -746,18 +752,45 @@ void Debugger::commandLoop()
         onSetActive_(false);
 }
 
-void Debugger::addBreakPoint(std::uint64_t physicalAddress)
+Debugger::BreakPoint& Debugger::getFreeBreakPoint()
 {
     for (size_t i = 0; i < maxBreakPoints; ++i) {
         auto& bp = breakPoints_[i];
-        if (bp.active)
+        if (bp.type != BreakPoint::Type::INACTIVE)
             continue;
-        bp.active = true;
-        bp.phys = physicalAddress;
-        std::println("Breakpoint {} added: {:X}", i, physicalAddress);
-        return;
+        return bp;
     }
     throw std::runtime_error { "Too many breakpoints" };
+}
+
+void Debugger::addPhysicalBreakPoint(std::uint64_t physicalAddress)
+{
+    auto& bp = getFreeBreakPoint();
+    bp.type = BreakPoint::Type::PHYSICAL;
+    bp.address = physicalAddress;
+    std::println("Breakpoint {} added for physical address {:X}", &bp - breakPoints_, physicalAddress);
+}
+
+void Debugger::addBreakPoint(std::uint16_t segment, std::uint64_t offset)
+{
+    auto& bp = getFreeBreakPoint();
+    bp.type = BreakPoint::Type::LOGICAL;
+    bp.seg = segment;
+    bp.address = offset;
+    std::println("Breakpoint {} added for {:04X}:{:04X}", &bp - breakPoints_, bp.seg, bp.address);
+}
+
+void Debugger::registerFunction(const std::string& name, const FunctionCallback& callback)
+{
+    if (!functions_.insert({ name, callback }).second)
+        throw std::runtime_error { name + " already registered as debugger command" };
+}
+
+uint64_t Debugger::getPhysicalIp(const CPUState& st)
+{
+    DebuggerMemState ms;
+    initMemState(ms, SREG_CS, st.ip_);
+    return toPhys(ms, 0);
 }
 
 uint64_t Debugger::peekMem(uint64_t physAddress, size_t size)
@@ -767,6 +800,35 @@ uint64_t Debugger::peekMem(uint64_t physAddress, size_t size)
     for (size_t i = size; i--;)
         value = value << 8 | bus_.peekU8(physAddress + i);
     return value;
+}
+
+uint64_t Debugger::peekMemLinear(uint64_t lienarAddress, size_t size)
+{
+    assert(size <= 8);
+    uint64_t value = 0;
+    for (size_t i = size; i--;)
+        value = value << 8 | bus_.peekU8(toPhys(lienarAddress + i));
+    return value;
+}
+
+uint64_t Debugger::peekDescriptor(uint16_t sel)
+{
+    uint64_t base;
+    uint16_t limit;
+    if (sel & 4) {
+        if ((cpu_.ldt_.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) != (SD_ACCESS_MASK_P | SD_TYPE_LDT))
+            throw std::runtime_error { std::format("Invalid local descriptor {:04X} ldt={}", sel, cpu_.ldt_) };
+        base = cpu_.ldt_.base;
+        assert(cpu_.ldt_.limit <= 0xffff);
+        limit = static_cast<uint16_t>(cpu_.ldt_.limit);
+    } else {
+        base = cpu_.gdt_.base;
+        limit = cpu_.gdt_.limit;
+    }
+    const auto ofs = static_cast<uint32_t>(sel & ~7);
+    if (ofs + 7 > limit)
+        throw std::runtime_error { std::format("Descritor {:04X} outside {} limit ({:04X})", sel, sel & 4 ? "LDT" : "GDT", limit) };
+    return peekMemLinear(base + ofs, 8);
 }
 
 bool Debugger::handleLine(const std::string& line)
@@ -849,22 +911,66 @@ bool Debugger::handleLine(const std::string& line)
         return numLines;
     };
 
-    if (cmd == "b") {
-        for (size_t i = 0; i < maxBreakPoints; ++i) {
-            auto& bp = breakPoints_[i];
-            if (bp.active)
-                std::println("0x{:X} {:X}", i, bp.phys);
+    auto getAddressAllowPhys = [&](DebuggerMemState& memState, bool isPhys) {
+        if (isPhys) {
+            if (auto physAddr = parser.getNumber(); physAddr) {
+                memState.sr = SREG_INVALID;
+                memState.address = Address { 0, *physAddr, 4 };
+                return;
+            }
+        } else if (getAddress(memState)) {
+            return;
         }
+        throw std::runtime_error { "Expected address" };
+    };
+
+    auto getAddressAndLinesAllowPhys = [&](DebuggerMemState& memState, bool isPhys) {
+        uint64_t numLines = defaultNumLines;
+        if (isPhys) {
+            if (auto physAddr = parser.getNumber(); physAddr) {
+                memState.sr = SREG_INVALID;
+                memState.address = Address { 0, *physAddr, 4 };
+                numLines = getLines();
+            }
+        } else {
+            numLines = getAddressAndNumLines(memState);
+        }
+        return numLines;
+    };
+
+    if (cmd == "b") {
+        DebuggerMemState ms;
+        initMemState(ms, SREG_CS, 0);
+        if (!getAddress(ms))
+            throw std::runtime_error { "Address missing" };
+        addBreakPoint(ms.address.segment(), ms.address.offset());
     } else if (cmd == "bd") {
         auto index = parser.getNumber();
         if (!index || *index >= maxBreakPoints)
             throw std::runtime_error { "Invalid breakpoint index" };
-        breakPoints_[*index].active = false;
+        breakPoints_[*index].type = BreakPoint::Type::INACTIVE;
+    } else if (cmd == "bl") {
+        for (size_t i = 0; i < maxBreakPoints; ++i) {
+            auto& bp = breakPoints_[i];
+            switch (bp.type) {
+            case BreakPoint::Type::INACTIVE:
+                break;
+            case BreakPoint::Type::PHYSICAL:
+                std::println("0x{:X} {:06X} physical", i, bp.address);
+                break;
+            case BreakPoint::Type::LOGICAL:
+                std::println("0x{:X} {:04X}:{:04X} logical", i, bp.seg, bp.address);
+                break;
+            }
+        }
     } else if (cmd == "bp") {
         auto phys = parser.getNumber();
         if (!phys)
             throw std::runtime_error { "Physical address missing" };
-        addBreakPoint(*phys);
+        addPhysicalBreakPoint(*phys);
+    } else if (cmd == "cr") {
+        for (size_t i = 0; i < std::size(cpu_.cregs_); ++i)
+            std::println("CR{} {:08X}", i, cpu_.cregs_[i]);
     } else if (cmd == "d" || cmd == "dp" || cmd == "d16" || cmd == "d32" || cmd == "dp16" || cmd == "dp32") {
         const bool isPhys = cmd.length() > 1 && cmd[1] == 'p';
         auto cpuInfo = cpu_.cpuInfo();
@@ -873,19 +979,10 @@ bool Debugger::handleLine(const std::string& line)
         else if (cmd.ends_with("32"))
             cpuInfo.defaultOperandSize = 4;
 
-        uint64_t numLines = defaultNumLines;
-        if (isPhys) {
-            if (auto physAddr = parser.getNumber(); physAddr) {
-                disAsmAddr_.sr = SREG_INVALID;
-                disAsmAddr_.address = Address { 0, *physAddr, cpu_.defaultOperandSize() };
-                numLines = getLines();
-            }
-        } else {
-            numLines = getAddressAndNumLines(disAsmAddr_);
-        }
+        uint64_t numLines = getAddressAndLinesAllowPhys(disAsmAddr_, isPhys);
         uint64_t offset;
         auto ifetch = [&]() {
-            uint64_t addr = isPhys ? disAsmAddr_.address.offset() : toPhys(disAsmAddr_, offset);
+            uint64_t addr = isPhys ? disAsmAddr_.address.offset() + offset : toPhys(disAsmAddr_, offset);
             offset++;
             return bus_.peekU8(addr);
         };
@@ -904,15 +1001,36 @@ bool Debugger::handleLine(const std::string& line)
         }
     } else if (cmd == "g") {
         return false;
-    } else if (cmd == "gdt") {
-        const auto& gdt = cpu_.gdt_;
-        std::println("GDT base={:08X} limit={:04X}", gdt.base, gdt.limit);
-        for (uint32_t offset = 0; offset + 7 <= gdt.limit; offset += 8) {
-            const auto descValue = peekMem(toPhys(gdt.base + offset), 8);
-            if (descValue & DESCRIPTOR_MASK_PRESENT) {
-                const auto desc = SegmentDescriptor::fromU64(descValue);
+    } else if (cmd == "gdt" || cmd == "ldt") {
+        const bool local = cmd == "ldt";
+        uint64_t base;
+        uint32_t limit;
+        if (local) {
+            if ((cpu_.ldt_.access & (SD_ACCESS_MASK_P | SD_ACCESS_MASK_S | SD_ACCESS_MASK_TYPE)) != (SD_ACCESS_MASK_P | SD_TYPE_LDT))
+                throw std::runtime_error { std::format("Invalid local descriptor table {}", cpu_.ldt_) };
+            base = cpu_.ldt_.base;
+            limit = cpu_.ldt_.limit;
+        } else {
+            base = cpu_.gdt_.base;
+            limit = cpu_.gdt_.limit;
+        }
+
+        auto ofs = parser.getNumber();
+
+        uint32_t start = 0;
+        uint32_t end = limit;
+
+        if (ofs) {
+            start = static_cast<uint32_t>(*ofs & ~7);
+            end = std::min(limit, start + 7);
+        } else {
+            std::println("{}DT base={:08X} limit={:04X}", local ? "L" : "G", base, limit);
+        }
+        for (uint32_t offset = start; offset + 7 <= end; offset += 8) {
+            const auto descValue = peekMemLinear(base + offset, 8);
+            const auto desc = SegmentDescriptor::fromU64(descValue);
+            if ((desc.access & SD_ACCESS_MASK_TYPE) || ofs)
                 std::println("{:02X} {:016X} {}", offset, descValue, desc);
-            }
         }
     } else if (cmd == "h") {
         cpu_.showHistory();
@@ -922,7 +1040,7 @@ bool Debugger::handleLine(const std::string& line)
         const auto& idt = cpu_.idt_;
         std::println("IDT base={:08X} limit={:04X}", idt.base, idt.limit);
         for (uint32_t idtOffset = 0; idtOffset + 7 <= idt.limit; idtOffset += 8) {
-            const auto desc = peekMem(toPhys(idt.base + idtOffset), 8);
+            const auto desc = peekMemLinear(idt.base + idtOffset, 8);
             if (desc) {
                 const auto offset = (desc & 0xffff) | ((desc >> 48) << 16);
                 const auto selector = static_cast<uint16_t>((desc >> 16) & 0xffff);
@@ -932,11 +1050,12 @@ bool Debugger::handleLine(const std::string& line)
                 std::println("Int{:02X} {:016X} {:X}:{:08X} DPL={} Type={:02X}", idtOffset / 8, desc, selector, offset, dpl, type);
             }
         }
-    } else if (cmd == "m") {
-        uint64_t numLines = getAddressAndNumLines(hexDumpAddr_);
+    } else if (cmd == "m" || cmd == "mp") {
+        const bool isPhys = cmd.length() > 1 && cmd[1] == 'p';
+        uint64_t numLines = getAddressAndLinesAllowPhys(hexDumpAddr_, isPhys);
         HexDump(hexDumpAddr_.address, numLines * 16, [&](uint64_t offset) -> std::optional<std::uint8_t> {
             try {
-                return bus_.peekU8(toPhys(hexDumpAddr_, offset));
+                return bus_.peekU8(isPhys ? hexDumpAddr_.address.offset() + offset : toPhys(hexDumpAddr_, offset));
             } catch (...) {
                 return {};
             }
@@ -992,14 +1111,145 @@ bool Debugger::handleLine(const std::string& line)
             traceCount_ = static_cast<uint32_t>(*n);
         }
         return false;
+    } else if (cmd == "virt") {
+        uint64_t virtStart = 0;
+        uint64_t virtLen = 0;
+        uint64_t curVirt = 0;
+
+        auto finish = [&]() {
+            if (virtLen) {
+                std::println("{:08X}-{:08X} 0x{:X} KB", virtStart, virtStart + virtLen - 1, virtLen/1024);
+            }
+            virtLen = 0;
+        };
+
+        for (uint32_t pdeEntry = 0; pdeEntry < 1024; ++pdeEntry) {
+            const auto pde = peekMem(cpu_.cregs_[3] + pdeEntry * 4, 4);
+            if (!(pde & PT32_MASK_P)) {
+                finish();
+                curVirt += 4096 * 1024;
+                continue;
+            }
+            for (uint32_t ptEntry = 0; ptEntry < 1024; ++ptEntry, curVirt += 4096) {
+                const auto pte = peekMem((pde & PT32_MASK_ADDR) + ptEntry * 4, 4);
+                if (!(pte & PT32_MASK_P)) {
+                    finish();
+                    continue;
+                }
+                if (!virtLen)
+                    virtStart = curVirt;
+                virtLen += 4096;
+            }
+        }
+        finish();
     } else if (cmd == "q") {
         exit(0);
     } else if (cmd == "z") {
-        auto phys = GetPhysicalIp(cpu_);
-        (void)Decode(cpu_.cpuInfo(), [&]() { return bus_.peekU8(phys++); });
-        autoBreakPoint_.active = true;
-        autoBreakPoint_.phys = phys;
+        auto phys = getPhysicalIp(cpu_);
+        auto res = Decode(cpu_.cpuInfo(), [&]() { return bus_.peekU8(phys++); });
+        if (cpu_.protectedMode() && cpu_.cpl() == 0 && res.instructionBytes[0] == 0xCD && res.instructionBytes[1] == 0x20) {
+            std::println("Skipping over VxdCall!");
+            phys += 4;
+        }
+        autoBreakPoint_.type = BreakPoint::Type::PHYSICAL;
+        autoBreakPoint_.address = phys;
         return false;
+    } else if (cmd[0] == 'x') {
+        const bool isPhys = cmd.length() > 1 && cmd[1] == 'p';
+        size_t pos = isPhys ? 2 : 1;
+
+        constexpr uint32_t bytesPerLine = 32;
+        constexpr char defaultFmt = 'w';
+        char format = defaultFmt;
+        uint32_t count = 0;
+
+        struct FormatDesc {
+            size_t size;
+        };
+        static const std::map<char, FormatDesc> fmtDesc {
+            { 'b', FormatDesc { 1 } },
+            { 'w', FormatDesc { 2 } },
+            { 'd', FormatDesc { 4 } },
+            { 'q', FormatDesc { 8 } },
+        };
+
+        if (pos < cmd.length()) {
+            if (cmd[pos] != '/')
+                throw std::runtime_error { "Invalid 'x' format" };
+            ++pos;
+            for (; pos < cmd.length() && IsDigit(cmd[pos]); ++pos)
+                count = count * 10 + cmd[pos] - '0';
+            for (; pos != cmd.length(); ++pos) {
+                format = cmd[pos];
+                if (fmtDesc.find(format) == fmtDesc.end())
+                    break;
+            }
+            if (pos != cmd.length())
+                throw std::runtime_error { "Unknown format \"" + std::string(cmd.substr(pos)) + "\"" };
+        }
+        assert(fmtDesc.find(format) != fmtDesc.end());
+        const auto& fmt = fmtDesc.find(format)->second;
+
+        if (count == 0)
+            count = static_cast<uint32_t>(bytesPerLine / fmt.size);
+
+        DebuggerMemState ms;
+        initMemState(ms, SREG_DS, 0);
+        getAddressAllowPhys(ms, isPhys);
+
+        uint32_t offset = 0;
+
+        const auto itemsPerLine = bytesPerLine / fmt.size;
+
+        for (size_t item = 0; item < count; ++item) {
+            uint8_t buffer[8];
+
+            if (item % itemsPerLine == 0) {
+                if (isPhys)
+                    std::print("{:08x} ", ms.address.offset() + offset);
+                else
+                    std::print("{} ", ms.address + offset);
+            }
+
+            for (size_t i = 0; i < fmt.size; ++i, ++offset)
+                buffer[fmt.size - 1 - i] = bus_.peekU8(isPhys ? ms.address.offset() + offset : toPhys(ms, offset));
+            std::print("{}", HexString(buffer, fmt.size));
+            if ((item + 1) % itemsPerLine == 0)
+                std::println("");
+            else
+                std::print(" ");
+        }
+        if (count % itemsPerLine)
+            std::println("");
+    } else if (auto it = functions_.find(std::string(cmd)); it != functions_.end()) {
+        struct DebugIf : public DebuggerInterface {
+            explicit DebugIf(DebuggerLineParser& lp)
+                : lp_ { lp }
+            {
+            }
+            bool moreArgs() override
+            {
+                return lp_.atEnd();
+            }
+            std::optional<std::uint64_t> getNumber() override
+            {
+                auto n = lp_.getNumber();
+                if (n)
+                    lp_.skipSpace();
+                return n;
+            }
+            std::optional<std::string> getString() override
+            {
+                auto w = lp_.getWord();
+                if (w.empty())
+                    return {};
+                lp_.skipSpace();
+                return std::string { w };
+            }
+        private:
+            DebuggerLineParser& lp_;
+        } debuggerInterface { parser };
+        it->second(debuggerInterface, cmd);
     } else {
         std::print("Unknown command \"{}\"\n", cmd);
     }

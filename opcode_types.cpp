@@ -51,7 +51,6 @@ const char* const ModeStrings[] = {
     "Mp",
     "Mptp",
     "Ms",
-    "Mw",
     "MwRv",
     "Ob",
     "Ov",

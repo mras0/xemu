@@ -316,9 +316,9 @@ InstructionDecodeResult Decode(const CPUInfo& cpuInfo, std::function<std::uint8_
     }
 
     const auto* ins = &instructionTable[opcode];
-    if (ins->mnemonic == InstructionMnem::UNDEF) {
-        throw std::runtime_error { "TODO: Undefined instruction " + HexString(fullOpcode) };
-    }
+    //if (ins->mnemonic == InstructionMnem::UNDEF)
+    //    throw std::runtime_error { "TODO: Undefined instruction " + HexString(fullOpcode) };
+
     const bool hasModrm = hasModrmTable[opcode / 32] & (1 << (opcode % 32));
     const uint8_t modrm = hasModrm ? ibfetch() : 0;
 
@@ -595,7 +595,7 @@ static const char* SegStringFromPrefix(std::uint8_t prefix)
     }
 }
 
-std::format_context::iterator std::formatter<DecodedEAInfo>::format(const DecodedEAInfo& info, std::format_context& ctx) const
+static std::string FormatDecodedEA(const DecodedEAInfo& info, LabelLookupFunc labelLookup)
 {
     char buffer[32];
     const auto& ea = info.ea;
@@ -614,8 +614,13 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
     };
 
     auto RelAddress = [&](const Address& a, size_t width = 4) {
+        if (labelLookup) {
+            auto lab = labelLookup(a.offset());
+            if (!lab.empty())
+                return lab;
+        }
         // TODO: Depending on processor mode...
-        *std::format_to_n(buffer, sizeof(buffer), "0x{:0{}X}", a.offset(), width).out = '\0';
+        return std::format("0x{:0{}X}", a.offset(), width);
     };
 
     std::string mem;
@@ -641,16 +646,16 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
     switch (ea.type) {
     case DecodedEAType::reg8:
         assert(ea.regNum < 8);
-        return std::formatter<const char*>::format(Reg8Text[ea.regNum], ctx);
+        return Reg8Text[ea.regNum];
     case DecodedEAType::reg16:
         assert(ea.regNum < 8);
-        return std::formatter<const char*>::format(Reg16Text[ea.regNum], ctx);
+        return Reg16Text[ea.regNum];
     case DecodedEAType::reg32:
         assert(ea.regNum < 8);
-        return std::formatter<const char*>::format(Reg32Text[ea.regNum], ctx);
+        return Reg32Text[ea.regNum];
     case DecodedEAType::sreg:
         assert(ea.regNum < 8);
-        return std::formatter<const char*>::format(SRegText[ea.regNum], ctx);
+        return SRegText[ea.regNum];
     case DecodedEAType::creg:
         *std::format_to_n(buffer, sizeof(buffer), "CR{}", ea.regNum).out = '\0';
         break;
@@ -670,6 +675,8 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
         *std::format_to_n(buffer, sizeof(buffer), "0x{:04X}:0x{:08X}", ea.address >> 32, ea.address & 0xffffffff).out = '\0';
         break;
     case DecodedEAType::imm8:
+        if (info.memSize)
+            return std::format("0x{:0{}X}", SignExtend(ea.immediate & 0xff, 1) & ((1ULL << info.memSize * 8) - 1), info.memSize * 2);
         *std::format_to_n(buffer, sizeof(buffer), "0x{:02X}", ea.immediate & 0xff).out = '\0';
         break;
     case DecodedEAType::imm16:
@@ -679,14 +686,11 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
         *std::format_to_n(buffer, sizeof(buffer), "0x{:08X}", ea.immediate & 0xffffffff).out = '\0';
         break;
     case DecodedEAType::rel8:
-        RelAddress(info.addr + static_cast<int8_t>(ea.immediate & 0xff));
-        break;
+        return RelAddress(info.addr + static_cast<int8_t>(ea.immediate & 0xff));
     case DecodedEAType::rel16:
-        RelAddress(info.addr + static_cast<int16_t>(ea.immediate & 0xffff));
-        break;
+        return RelAddress(info.addr + static_cast<int16_t>(ea.immediate & 0xffff));
     case DecodedEAType::rel32:
-        RelAddress(info.addr + static_cast<int32_t>(ea.immediate & 0xffffffff), 8);
-        break;
+        return RelAddress(info.addr + static_cast<int32_t>(ea.immediate & 0xffffffff), 8);
     case DecodedEAType::rm16: {
         switch (ModrmMod(ea.rm)) {
         case 0b00:
@@ -751,7 +755,7 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
             *std::format_to_n(buffer, sizeof(buffer), "{}{}{}]", mem, Reg32Text[ModrmRm(ea.rm)], disp_string(static_cast<int8_t>(ea.disp), 2)).out = '\0';
             break;
         case 0b10:
-            *std::format_to_n(buffer, sizeof(buffer), "{}{}{}]", mem, Reg32Text[ModrmRm(ea.rm)], disp_string(static_cast<int8_t>(ea.disp), 8)).out = '\0';
+            *std::format_to_n(buffer, sizeof(buffer), "{}{}{}]", mem, Reg32Text[ModrmRm(ea.rm)], disp_string(static_cast<int32_t>(ea.disp), 8)).out = '\0';
             break;
         default:
             throw std::runtime_error { "TODO: Format rm32 " + ModrmString(ea.rm) };
@@ -761,11 +765,15 @@ std::format_context::iterator std::formatter<DecodedEAInfo>::format(const Decode
     default:
         throw std::runtime_error { std::string("format: Unknown DecodedEAType ") + DecodedEATypeText(ea.type) };
     }
-    return std::formatter<const char*>::format(buffer, ctx);
+    return buffer;
 }
 
+std::format_context::iterator std::formatter<DecodedEAInfo>::format(const DecodedEAInfo& info, std::format_context& ctx) const
+{
+    return std::formatter<const char*>::format(FormatDecodedEA(info, {}).c_str(), ctx);
+}
 
-std::string FormatDecodedInstruction(const InstructionDecodeResult& ins, const Address& addr)
+std::string FormatDecodedInstruction(const InstructionDecodeResult& ins, const Address& addr, LabelLookupFunc labelLookup)
 {
     std::string res = "";
 
@@ -904,14 +912,17 @@ std::string FormatDecodedInstruction(const InstructionDecodeResult& ins, const A
 
         if (memSize == opSize)
             memSize = 0;
+    } else if (ins.numOperands == 1 && EAIsMemory(ins.ea[0].type)) {
+        if (ResultSizeFromOpmode(ins.instruction->operands[0], ins.operationSize, ins.instruction->mnemonic))
+            memSize = ins.operandSize;
     }
 
     for (int i = 0; i < ins.numOperands; ++i)
-        res += std::format("{}{}", i ? ", " : "\t", DecodedEAInfo { ins.ea[i], addr + ins.numInstructionBytes, ins.prefixes, memSize });
+        res += std::format("{}{}", i ? ", " : "\t", FormatDecodedEA(DecodedEAInfo { ins.ea[i], addr + ins.numInstructionBytes, ins.prefixes, memSize }, labelLookup));
     return res;
 }
 
-std::string FormatDecodedInstructionFull(const InstructionDecodeResult& ins, const Address& addr)
+std::string FormatDecodedInstructionFull(const InstructionDecodeResult& ins, const Address& addr, LabelLookupFunc labelLookup)
 {
     const int maxBytesPerLine = 8; // Makes the instruction start on a new tab position
     std::string res;
@@ -929,5 +940,5 @@ std::string FormatDecodedInstructionFull(const InstructionDecodeResult& ins, con
             res += "  ";
     }
     res += " ";
-    return res + FormatDecodedInstruction(ins, addr);
+    return res + FormatDecodedInstruction(ins, addr, labelLookup);
 }

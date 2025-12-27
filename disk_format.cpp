@@ -8,8 +8,11 @@ static const DiskFormat* diskFormats[] = {
     &diskFormat360K,
     &diskFormat720K,
     &diskFormat1440K,
+    &diskFormat1680K,
     // Hard drive formats
     &diskFormatST157A,
+    &diskFormatST1133A,
+    &diskFormatSL520,
 };
 
 const DiskFormat& DiskFormatFromMediaDescriptor(uint8_t mediaDescriptor)
@@ -32,7 +35,7 @@ const DiskFormat& DiskFormatFromBootSector(const uint8_t* data, size_t size)
 {
     // TODO: Read drive geometry for harddisks if available
     assert(size % bytesPerSector == 0);
-    assert(size >= 180*140);
+    assert(size >= bytesPerSector);
     const auto mediaDescriptor = data[0x15];
     const auto& format = DiskFormatFromMediaDescriptor(mediaDescriptor);
     if (format.sizeInBytes() != size)

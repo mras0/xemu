@@ -20,48 +20,94 @@ SER_OUTPUT EQU 1        ; Write output to 0x3f8
 ; Manual says you need JMPF, but is RET[F] or other control transfers OK?
 ; Dosbox doesn't like SS=0 in TSS for v86 test (at start)
 ; Dosbox/Qemu allows unreal mode in v86!
-; TODO: IO permission bitmap test
-; TODO: Test "NT" flag
+; TODO: Should a RMW operation set the W bit? Qemu/bochs do not agree.
+; TODO: Test "NT" flag + Task linking/switching (80386 PRM section 7.6)
 ; TODO: Which flags are allowed to be pushed/popped
 ; TODO: INT allowed to interrupt level 3...
+; TODO: Verify error code for interrupt not present/not an interrupt gate
+; TODO: Test 32-bit call gate from 16-bit mode (and vice versa)
+; TODO: Test LDT
+; TODO: Need to enable A20 before test (or at least ensure it's on)
 
         cpu 386
         bits 16
         org 0
+
+%include "gdt.inc"
 
 ROM_SIZE EQU 0x10000
 
 INT_HANDLER_COUNT EQU 32
 INT_HANDLER_SIZE EQU 4
 
-DISPLAY_CURSOR_ADDR EQU 0x400
-IDT_BASE EQU 0x1000
-GDT_BASE EQU 0x2000
-TSS_BASE EQU 0x2F00
-SCRATCH EQU 0x3000
-
-GDT_SEL_CODE32 EQU 0x08
-GDT_SEL_DATA32 EQU 0x10
-GDT_SEL_ORIG16 EQU 0x18
-GDT_SEL_DATA16 EQU 0x20
-GDT_SEL_TSS    EQU 0x28
-
-MAX_IO_PORT EQU 0x400
+MAX_IO_PORT EQU 0x500
 
 TSS_SS0  EQU 0x08
 TSS_ESP0 EQU 0x04
 TSS_IOPB EQU 0x66
-TSS_BASE_SIZE EQU 0x6C
-TSS_SIZE EQU 0x6C+4*((MAX_IO_PORT+31)/32)
+TSS_BASE_SIZE EQU 0x68
+TSS_SIZE EQU TSS_BASE_SIZE+4*((MAX_IO_PORT+31)/32)
 TSS_IO_BITMAP_START EQU TSS_BASE_SIZE
 
-EXCEPTION_UD EQU 6
-EXCEPTION_GP EQU 13
+TSS16_SP0 EQU 0x02
+TSS16_SS0 EQU 0x04
+TSS16_SIZE EQU 0x2C
 
+EXCEPTION_UD EQU 6
+EXCEPTION_NP EQU 11
+EXCEPTION_GP EQU 13
+EXCEPTION_PF EQU 14
+
+EFLAGS_MASK_ALWAYS0 EQU 1<<15|1<<5|1<<3
+EFLAGS_MASK_ALWAYS1 EQU 1<<1
+EFLAGS_MASK_IF EQU 1<<9
 EFLAGS_BIT_IOPL EQU 12
+EFLAGS_MASK_TF EQU 1<<8
 EFLAGS_MASK_VM EQU 1<<17
 
 HAS_ERROR_CODE_MASK EQU 1<<8|1<<10|1<<11|1<<12|1<<13|1<<14|1<<17|1<<30
+
+DISPLAY_CURSOR_ADDR EQU 0x400
+IDT_BASE EQU 0x1000
+EMU_ID EQU 0x1800
+GDT_BASE EQU 0x2000
+LDT_BASE EQU 0x2400
+LDT_SIZE EQU 0x60
+TSS_BASE EQU 0x2800
+TSS16_BASE EQU TSS_BASE+TSS_SIZE
+SCRATCH EQU 0x3000
+STACK2_TOP EQU 0x7000
+STACK1_TOP EQU 0x8000
+
+
+PAGE_SIZE       EQU 4096
+
+PT_MASK_P       EQU 1<<0        ; Present
+PT_MASK_W       EQU 1<<1        ; Writable
+PT_MASK_U       EQU 1<<2        ; User
+
+PAGING_BASE     EQU 0x10000
+
+%assign PAGING_NEXT_PAGE PAGING_BASE
+%macro ALLOC_PAGES 1-2 1
+%1 EQU PAGING_NEXT_PAGE
+%assign PAGING_NEXT_PAGE PAGING_NEXT_PAGE+(PAGE_SIZE*%2)
+%endmacro
+
+ALLOC_PAGES PDT_BASE
+ALLOC_PAGES PD000               ; Identity map  00000000-00400000 (only mapped to 00100000)
+ALLOC_PAGES PD800               ; Test map      80000000-80400000
+ALLOC_PAGES TEST_PAGE0
+ALLOC_PAGES TEST_PAGE1
+ALLOC_PAGES TEST_PAGE2
+
+TEST_PAGE0_VIRT EQU 0x80000000+0*PAGE_SIZE
+TEST_PAGE1_VIRT EQU 0x80000000+1*PAGE_SIZE
+TEST_PAGE2_VIRT EQU 0x80000000+2*PAGE_SIZE
+
+EMU_ID_OTHER EQU 0
+EMU_ID_DOSBOX EQU 1
+EMU_ID_QEMU EQU 2
 
 %macro PMODE_EXIT 0
         bits 32
@@ -76,7 +122,7 @@ HAS_ERROR_CODE_MASK EQU 1<<8|1<<10|1<<11|1<<12|1<<13|1<<14|1<<17|1<<30
 %%code16:
         push    eax
         mov     eax,cr0
-        and     al,0xfe
+        and     eax,0x7fffffe ; Not PE and no paging
         mov     cr0,eax
         pop     eax
 %endmacro
@@ -185,20 +231,43 @@ ComEntry:
         mov     cx,(65536-0x100)/4
         rep     movsd
 
+        mov     bl,EMU_ID_DOSBOX
         ; For the sake of DosBox use iret to clear NT flag ?!?!?!
         ;jmp     COM_SEG:BiosEntry
         push    0
         push    COM_SEG
-        push    BiosEntry
+        push    Entry2
         iret
 
 BiosEntry:
+        mov     bl,EMU_ID_OTHER
+        xor     ax,ax
+        mov     ds,ax
+        mov     word [EXCEPTION_UD*4],Entry2
+        mov     [EXCEPTION_UD*4+2],cs
+        mov     eax,0x40000000
+        xor     ebx,ebx
+        xor     ecx,ecx
+        xor     edx,edx
+        db      0x0F, 0xA2 ; CPUID
+        cmp     ebx,'TCGT'
+        je      .qemu
+        cmp     ebx,'KVMK'
+        jne     .other
+.qemu:
+        mov     bl,EMU_ID_QEMU
+        jmp     Entry2
+.other:
+        mov     bl,EMU_ID_OTHER
+Entry2:
 	cli
         cld
 	xor	ax,ax
 	mov	ss,ax
-        mov     ax,0x8000
+        mov     ax,STACK1_TOP
         mov     sp,ax
+
+        mov     [ss:EMU_ID],bl
 
         ; Mask all interrupts
         mov     al,0xff
@@ -219,6 +288,10 @@ BiosEntry:
         pop     ds
         mov     si,HelloMsg
         call    PrintString
+        mov     al,[ss:EMU_ID]
+        call    PrintByte
+        mov     al,10
+        call    PrintChar
 
         mov     dx,RealIntHandlers
         mov     cx,INT_HANDLER_COUNT
@@ -254,6 +327,11 @@ BiosEntry:
         add     ebx,INT_HANDLER_SIZE
         loop    .protidt
 
+        ; Make a not present handler
+        xor     eax,eax
+        stosd
+        stosd
+
         mov     di,GDT_BASE
         push    cs
         pop     ds
@@ -261,10 +339,18 @@ BiosEntry:
         mov     cx,(ProtGDTEnd-ProtGDT)/4
         rep     movsd
 
-        ; Fix offset of "ORIG16" descriptor
+        ; Fix offset of "ORIG16", "ORIG32" and "USER16" descriptors
         mov     eax,cs
         shl     eax,4
         or      [es:GDT_BASE+GDT_SEL_ORIG16+2],eax
+        or      [es:GDT_BASE+GDT_SEL_USER16+2],eax
+        or      [es:GDT_BASE+GDT_SEL_ORIG32+2],eax
+
+        ; Init LDT
+        mov     di,LDT_BASE
+        xor     eax,eax
+        mov     ecx,LDT_SIZE/4
+        rep     stosd
 
         ; Clear TSS
         mov     edi,TSS_BASE
@@ -272,14 +358,15 @@ BiosEntry:
         xor     eax,eax
         rep     stosd
         ; Init IOPB
-        mov     word [TSS_BASE+TSS_IOPB],TSS_IO_BITMAP_START
+        mov     word [es:TSS_BASE+TSS_IOPB],TSS_IO_BITMAP_START
 
         POST    0
 
         call    TestRealModeLimit
         call    TestUnrealmode
         call    TestTransitionCPL
-        call    TestRealmodeSTR
+        call    TestRealModeSTR
+        call    TestRealModeFlags
 
         POST    1
 
@@ -311,11 +398,24 @@ BiosEntry:
         test    al,1
         CHECK_CC nz
 
+        or      ax,4
+        lmsw    ax
+        mov     ebx,cr0
+        CHECK_EQ ax,bx
+
+        ; Task is marked available
+        CHECK_EQ byte [GDT_BASE+GDT_SEL_TSS+5],0x89
+
         ; LTR/STR
+        xor     eax,eax
         mov     ax,GDT_SEL_TSS
         ltr     ax
         str     ebx
         CHECK_EQ ax,bx
+
+        ; Task is marked busy
+        mov     bl,[GDT_BASE+GDT_SEL_TSS+5]
+        CHECK_EQ bl,0x8B
 
         ; SGDT
         mov     ax,GDT_SEL_DATA32
@@ -329,6 +429,26 @@ BiosEntry:
         mov     eax,[es:ProtGDTR+2]
         CHECK_EQ [edi+2],eax
 
+        ; SIDT
+        mov     edi,SCRATCH
+        sidt    [edi]
+        mov     ax,GDT_SEL_ORIG16
+        mov     es,ax
+        mov     ax,[es:ProtIDTR]
+        CHECK_EQ [edi],ax
+        mov     eax,[es:ProtIDTR+2]
+        CHECK_EQ [edi+2],eax
+
+        ; LLDT / SGDT
+        mov     ax,GDT_SEL_LDT
+        lldt    ax
+        sldt    bx
+        CHECK_EQ bx,ax
+        xor     ax,ax
+        lldt    ax
+        sldt    bx
+        CHECK_EQ bx,ax
+
         ; IRET in protected mode
         xor     eax,eax
         push    eax
@@ -337,20 +457,81 @@ BiosEntry:
         push    eax
         iret
 .iret:
+
+        ; LSL
+        mov     eax,0xf000 ; over limit
+        mov     edx,0xabcd
+        lsl     edx,eax
+        CHECK_CC nz
+        CHECK_EQ edx,0xabcd
+        mov     eax,GDT_SEL_CODE32|2 ; RPL > DPL
+        lsl     edx,eax
+        CHECK_CC nz
+        CHECK_EQ edx,0xabcd
+        mov     eax,GDT_SEL_CODE32
+        lsl     edx,eax
+        CHECK_CC z
+        CHECK_EQ edx,0x67fff<<12|0xfff
+
+        xor     eax,eax
+        push    dword GDT_SEL_CODE32
+        lsl     eax,[esp]
+        CHECK_CC z
+        add     esp,4
+        CHECK_EQ eax,0x67fff<<12|0xfff
+
+
+        ; LAR
+        mov     eax,0xf000 ; over limit
+        mov     edx,0xabcd
+        lar     edx,eax
+        CHECK_CC nz
+        CHECK_EQ edx,0xabcd
+        mov     eax,GDT_SEL_DATA32
+        lar     edx,eax
+        CHECK_CC z
+        mov     ecx,[GDT_BASE+GDT_SEL_DATA32+4]
+        ; bits 19:16 are undefined
+        and     ecx,0x00f0ff00
+        and     edx,0xfff0ffff
+        CHECK_EQ edx,ecx
+
         POST    4
         call    TestV86
-
-        ; XXX: Not checked by DosBox!
-;        mov     ax,0
-;        mov     ds,ax
-;        mov     byte [0x1234],42
 
         mov     si,.msg
         CALL_V86 .printmsg
 
+        POST    6
+
+        call    GDT_SEL_ORIG16:TestTask16
+
+        POST    7
+
+        call    GDT_SEL_ORIG32:TestGP32
+
+        POST    8
+
+        ; Set max segment limit for GDT_SEL_CODE32
+        mov     ax,GDT_SEL_DATA32
+        mov     ds,ax
+        mov     word [GDT_BASE+GDT_SEL_CODE32],0xffff
+        or      byte [GDT_BASE+GDT_SEL_CODE32+6],0xf
+
+        GET_LINEAR_BASE eax
+        mov     ebx,.pgdone
+        add     ebx,eax
+        push    ebx ; return address
+        push    dword GDT_SEL_CODE32
+        add     eax,TestPaging
+        push    eax
+        retf
+.pgdone:
+
+        POST    0xff
         mov     si,.alltests
         CALL_V86 .printmsg
-        POST    0xff
+
 .stop:
         hlt
         jmp     .stop
@@ -379,7 +560,7 @@ RModeFail:
         sub     bp,3
 _Fail:
 ; Address of failure in EBP
-        DEBUG_BREAK
+        ;DEBUG_BREAK
         push    ds
         push    cs
         pop     ds
@@ -396,7 +577,7 @@ _Fail:
         jmp     .halt
 
 HelloMsg:
-        db "Starting test",10,0
+        db "Starting test",10,"EMU ID: ",0
 FailMsg:
         db "Test failed",10,0
 
@@ -566,38 +747,11 @@ ProtIntHandler:
         db " GS=",0
 
 ProtIDTR:
-        dw      INT_HANDLER_COUNT*8-1
+        dw      (INT_HANDLER_COUNT+1)*8-1
         dd      IDT_BASE
 
-GDT_FLAG_MASK_DB EQU 1<<2 ; 0=16-bit, 1=32-bit
-GDT_FLAG_MASK_G  EQU 1<<3 ; 0=1 byte limit, 1=4K limit
-
-GDT_ACCESS_BIT_DPL      EQU 5
-GDT_ACCESS_MASK_A       EQU 1<<0 ; Accessed
-GDT_ACCESS_MASK_RW      EQU 1<<1 ; Read/Write (for code means read access allowed, for data segment writable)
-GDT_ACCESS_MASK_DC      EQU 1<<2 ; Direction/Conforming
-GDT_ACCESS_MASK_E       EQU 1<<3 ; Executable
-GDT_ACCESS_MASK_S       EQU 1<<4 ; Set if code/data segment
-GDT_ACCESS_MASK_DPL     EQU 3<<GDT_ACCESS_BIT_DPL
-GDT_ACCESS_MASK_P       EQU 1<<7 ; Present
-
-GDT_ACCESS_CODE         EQU GDT_ACCESS_MASK_RW|GDT_ACCESS_MASK_E|GDT_ACCESS_MASK_S|GDT_ACCESS_MASK_P
-GDT_ACCESS_DATA         EQU GDT_ACCESS_MASK_RW|GDT_ACCESS_MASK_S|GDT_ACCESS_MASK_P
-
-%macro GDT_ENTRY 4 ; base, limit, access, flags
-        dw      ((%2)&0xffff)
-        dw      ((%1)&0xffff)
-        dw      (((%1)>>16)&0xff)|((%3)<<8)
-        dw      (((%2)>>16)&0xf)|((%4)<<4)|(((%1)>>24)<<8)
-%endmacro
-
 ProtGDT:
-        dd              0,0
-        GDT_ENTRY       0,0xfffff,GDT_ACCESS_CODE,GDT_FLAG_MASK_DB|GDT_FLAG_MASK_G
-        GDT_ENTRY       0,0xfffff,GDT_ACCESS_DATA,GDT_FLAG_MASK_DB|GDT_FLAG_MASK_G
-        GDT_ENTRY       0,0xffff,GDT_ACCESS_CODE,0 ; 16-bit code
-        GDT_ENTRY       0,0xffff,GDT_ACCESS_DATA,0 ; 16-bit data
-        GDT_ENTRY       TSS_BASE,TSS_SIZE-1,GDT_ACCESS_MASK_P|0x9,0 ; TSS
+        GDT_TABLE
 ProtGDTEnd:
 
 ProtGDTR:
@@ -933,7 +1087,8 @@ TestRealModeLimit:
         pop     ds
         mov     si,.FailMsg
         call    PrintString
-        ;jmp     RModeFail; XXX: This check isn't done by QEMU/DosBox...
+        cmp     byte [EMU_ID],EMU_ID_OTHER ; DosBox/qemu don't do this check
+        je      RModeFail
         pop     word [0xd*4]
         ret
 .ok:
@@ -992,7 +1147,7 @@ TestTransitionCPL:
 
         retf
 
-TestRealmodeSTR:
+TestRealModeSTR:
         xor     ax,ax
         mov     ds,ax
         push    word [EXCEPTION_UD*4]
@@ -1002,6 +1157,30 @@ TestRealmodeSTR:
 .ok:
         add     sp,6
         pop     word [EXCEPTION_GP*4]
+        ret
+
+TestRealModeFlags:
+        ; FreeDOS JEMMEX 386 test:
+        mov     ax,0x7000
+        push    ax
+        popf
+        pushf
+        pop     bx
+        or      al,2 ; bit 1 is always set
+        cmp     ax,bx
+        jne     RModeFail
+
+        push    0xffff-EFLAGS_MASK_TF
+        popf
+        pushf
+        pop     ax
+        cmp     ax,~(EFLAGS_MASK_ALWAYS0|EFLAGS_MASK_TF)
+        jne     RModeFail
+
+        ; For DosBOX make sure NT is cleared..
+        xor     ax,ax
+        push    ax
+        popf
         ret
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1027,15 +1206,14 @@ V86Call:
         mov     word [TSS_BASE+TSS_SS0],GDT_SEL_DATA32
         mov     [TSS_BASE+TSS_ESP0],esp
 
-        push    V86Exit
+        mov     word [STACK2_TOP-2],V86Exit ; Put exit function on V86 stack
         sub     esp,v86_sizeof
         mov     dword [esp+v86_EIP],ebp
         GET_REAL_SEG ebp
         mov     dword [esp+v86_CS],ebp
         mov     dword [esp+v86_Eflags],EFLAGS_MASK_VM
         xor     ebp,ebp
-        mov     [esp+v86_ESP],esp
-        add     dword [esp+v86_ESP],v86_sizeof
+        mov     dword [esp+v86_ESP],STACK2_TOP-2
         mov     [esp+v86_SS],ebp
         mov     [esp+v86_ES],ebp
         mov     [esp+v86_DS],ebp
@@ -1062,13 +1240,12 @@ TestV86:
         mov     word [TSS_BASE+TSS_SS0],GDT_SEL_DATA32
         mov     [TSS_BASE+TSS_ESP0],esp
 
-        mov     eax,esp
         push    0x65
         push    0xf5
         push    0xd5
         push    0xe5
         push    0
-        push    eax
+        push    STACK2_TOP
         push    dword EFLAGS_MASK_VM
         GET_REAL_SEG eax
         push    eax
@@ -1102,9 +1279,14 @@ V86start:
 
         or      byte [cs:0],0 ; Write through CS
 
+        ; Task marked busy
+        xor     ax,ax
+        mov     ds,ax
+        mov     al,[GDT_BASE+GDT_SEL_TSS+5]
+        CHECK_EQ al,0x8B
 
         ;
-        ; Check #GP for varoius instructions
+        ; Check #GP for various instructions
         ;
 
         ; First with complete state checked
@@ -1115,6 +1297,22 @@ V86start:
         cli
 .gp1:
         bits 32
+
+        push    ax
+        mov     ax,cs
+        CHECK_EQ ax,GDT_SEL_CODE32
+        mov     ax,ds
+        CHECK_EQ ax,0
+        mov     ax,es
+        CHECK_EQ ax,0
+        mov     ax,fs
+        CHECK_EQ ax,0
+        mov     ax,gs
+        CHECK_EQ ax,0
+        mov     ax,ss
+        CHECK_EQ ax,GDT_SEL_DATA32
+        pop     ax
+
         CHECK_EQ dword [esp+0],0 ; Error code
         CHECK_EQ dword [esp+4],.cli ; EIP
         CHECK_EQ dword [esp+8],eax  ; CS
@@ -1159,6 +1357,7 @@ V86start:
         GP2_TEST cli
         GP2_TEST pushf
         GP2_TEST popf
+        GP2_TEST lmsw ax
         call    .x ; push return address
 .x:
         push    word 0
@@ -1168,25 +1367,22 @@ V86start:
         add     sp,8
 
         GP2_TEST int 0x10
-        mov     dx,MAX_IO_PORT
+
+        mov     dx,MAX_IO_PORT-1
         xor     al,al
         out     dx,al   ; Allowed
-        ; TODO: Check access to IO ports > MAX_IO_PORT (Should #GP)
-        ; TODO: Check access to IO port where bit is 1 in IO bitmap
-        ; TODO: Try again with IOPL=3 (should succeed)
-        ;inc     dx
-        ;GP2_TEST out dx,al ; beyond permission bitmap limit
-;
-;        mov     dx,0x21
-;        mov     al,0xff
-;        out     dx,al   ; Allowed
-;
-;        xor     bx,bx
-;        mov     ds,bx
-;        or      byte [TSS_BASE+TSS_IO_BITMAP_START+0x21/8],1<<(0x21&7)
-;
-;        GP2_TEST out dx,al
+        inc     dx
+        GP2_TEST out dx,al ; beyond permission bitmap limit
 
+        xor     bx,bx
+        mov     ds,bx
+        or      byte [TSS_BASE+TSS_IO_BITMAP_START+(MAX_IO_PORT-1)/8],1<<((MAX_IO_PORT-1)&7)
+
+        mov     dx,MAX_IO_PORT-1 ; Disallowed in IO bitmap
+        GP2_TEST out dx,al
+
+        dec     dx
+        GP2_TEST out dx,ax ; Second part of port disallowed
 
         ; TODO: When is LOCK not allowed / handled specially?
         xor     ax,ax
@@ -1206,8 +1402,7 @@ V86start:
         cli
         call    RModeFail
 .cont3:
-
-        RESTORE_HANDLER EXCEPTION_GP
+        SET_HANDLER EXCEPTION_GP,.gp2
 
         ; now these are allowed
         sti
@@ -1220,41 +1415,149 @@ V86start:
         iret
         call    RModeFail
 .cont4:
-        cli     ; still allowed despite above flag change above
+        pushf
+        pop     ax
+        CHECK_EQ ax,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL
+
+        push    word ~EFLAGS_MASK_TF
+        popf
+        pushf
+        pop     ax
+        CHECK_EQ ax,~(EFLAGS_MASK_ALWAYS0|EFLAGS_MASK_TF)
+
+        push    word 0
+        popf
+        pushf
+        pop     ax
+        CHECK_EQ ax,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL ; IOPL not changed
+
+        mov     eax,0xabcdabcd
+        mov     ebx,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL
+        xor     ecx,ecx
+        inc     cl
+        pushfd
+        pop     eax
+        CHECK_EQ eax,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL
+
+        push    dword 0
+        popfd
+        pushfd
+        pop     eax
+        nop ; FIXME why does this make a difference for qemu/dosbox?
+        CHECK_EQ eax,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL
+
+        mov     dx,MAX_IO_PORT-2
+        out     dx,al ; Allowed
+        inc     dx
+        GP2_TEST out dx,al   ; Still checked even when IOPL=3
+        inc     dx
+        GP2_TEST out dx,al ; Still blocked
 
         push    word 0
         popf
         cli     ; still doesn't change IOPL
 
+        ; Interrupt handler not present
+        ; TOOD: Shouldn't error code be +2?
+        SET_HANDLER EXCEPTION_GP,.not_present_int
+        int     INT_HANDLER_COUNT
+        call    RModeFail
+.not_present_int:
+        bits 32
+        cmp     dword [esp],INT_HANDLER_COUNT*8 ; Error code
+        add     esp,4
+        mov     dword [esp],.not_present_int_done
+        iretd
+        bits    16
+.not_present_int_done:
+
+        SET_HANDLER EXCEPTION_GP,.wrong_dpl_int
+        int     0x10
+        call    RModeFail
+.wrong_dpl_int:
+        bits 32
+        cmp     dword [esp],INT_HANDLER_COUNT*8 ; Error code
+        add     esp,4
+        mov     dword [esp],.wrong_dpl_int_done
+        iretd
+        bits    16
+.wrong_dpl_int_done:
+        RESTORE_HANDLER EXCEPTION_GP
+
+
         ;
-        ; interrupts with DPL=3
+        ; Interrupts with DPL=3 and CODE16
         ;
 
-        ;TODO: This needs to be handled differently, selector can't be normal one
+        xor     ax,ax
+        mov     es,ax
+        mov     di,IDT_BASE+0xf*8
+        push    dword [es:di]
+        push    dword [es:di+4]
 
-;        xor     ax,ax
-;        mov     ds,ax
-;        mov     byte [IDT_BASE+0xf*8+5],0xe6 ; 16-bit interrupt gate DPL=3
-;        SET_HANDLER 0xf,.intF
-;        jmp     .afterintf
-;.intF:
-;        ;mov     bp,sp
-;        ;CHECK_EQ word [bp],.afterintf+2 ; IP is as expected
-;;        mov     ax,cs
-;;        CHECK_EQ [bp+2],ax
-;        iret
-;.afterintf:
-;        xchg    bx,bx
-;        int     0xf
-;
-;        xor     ax,ax
-;        mov     ds,ax
-;        mov     byte [IDT_BASE+0xf*8+5],0x8e ; Restore int gate to 32-bit DPL=0
-;        RESTORE_HANDLER 0xf
+        mov     ax,.int0F               ; offset low
+        stosw
+        mov     ax,GDT_SEL_ORIG16       ; selector
+        stosw
+        mov     ax,0xee00               ; 32-bit interrupt gate, DPL=3
+        stosw
+        xor     ax,ax                   ; offset high
+        stosw
+
+        push    word 0x1234
+        pop     ds
+        push    word 0x5678
+        pop     es
+        push    word 0x9abc
+        pop     fs
+        push    word 0xdef0
+        pop     gs
+
+        jmp     .after_int
+.int0F:
+        push    ax
+        mov     ax,cs
+        CHECK_EQ ax,GDT_SEL_ORIG16
+        mov     ax,ds
+        CHECK_EQ ax,0
+        mov     ax,es
+        CHECK_EQ ax,0
+        mov     ax,fs
+        CHECK_EQ ax,0
+        mov     ax,gs
+        CHECK_EQ ax,0
+        mov     ax,ss
+        CHECK_EQ ax,GDT_SEL_DATA32
+        pop     ax
+        CHECK_EQ dword [esp+0x00],.after_int+2
+        test    dword [esp+0x08],EFLAGS_MASK_VM
+        CHECK_CC nz
+        CHECK_EQ dword [esp+0x14],0x5678
+        CHECK_EQ dword [esp+0x18],0x1234
+        CHECK_EQ dword [esp+0x1C],0x9abc
+        CHECK_EQ dword [esp+0x20],0xdef0
+        iretd
+.after_int:
+        int     0xf
+
+        mov     ax,ds
+        CHECK_EQ ax,0x1234
+        mov     ax,es
+        CHECK_EQ ax,0x5678
+        mov     ax,fs
+        CHECK_EQ ax,0x9abc
+        mov     ax,gs
+        CHECK_EQ ax,0xdef0
+
+        ; Restore handler
+        xor    ax,ax
+        mov    ds,ax
+        pop    dword [IDT_BASE+0xf*8+4]
+        pop    dword [IDT_BASE+0xf*8]
 
         ;
         ; Limit check + unreal mode
-        ;
+        ; Not checked by DosBox/QEMU..
 
         xor     ax,ax
         mov     ds,ax
@@ -1262,6 +1565,8 @@ V86start:
         mov     edi,2*1024*1024+SCRATCH
         SET_HANDLER EXCEPTION_GP,.set_unreal
         mov     word [edi],0x1234
+        cmp     byte [EMU_ID],EMU_ID_OTHER
+        jne     .cont5
         call    RModeFail
         bits 32
 .set_unreal:
@@ -1280,13 +1585,17 @@ V86start:
         SET_HANDLER EXCEPTION_GP,.expect_fail
 
         CHECK_EQ word [edi],0x1234 ; DS is really reloaded with limit=0xffff
-        ; Not checked by DosBox/QEMU..
-        push    ds
+        RESTORE_HANDLER EXCEPTION_GP
         push    cs
         pop     ds
         mov     si,.v86_unreal_possible
         call PrintString
-        pop     ds
+        xor     ax,ax
+        mov     ds,ax
+        mov     al,[EMU_ID]
+        cmp     byte [EMU_ID],EMU_ID_OTHER
+        jne     .cont6
+        call    RModeFail
 .cont6:
         RESTORE_HANDLER EXCEPTION_GP
         CHECK_EQ word [SCRATCH],0xabcd
@@ -1297,8 +1606,29 @@ V86start:
         retf
 .cont7:
 
-        ; TODO: Test #UD instructions (e.g. "str ax")
+        %macro V86_UD_TEST 1+
+        mov     eax,%%instruction
+        mov     ebx,%%next
+%%instruction:
+        %1
+        call    RModeFail
+%%next:
+        %endmacro
 
+        SET_HANDLER EXCEPTION_UD,.udhandler
+        jmp     .cont8
+        bits 32
+.udhandler:
+        CHECK_EQ [esp],eax
+        mov     [esp],ebx
+        iretd
+        bits 16
+.cont8:
+        ; TODO: Check ALL!
+        V86_UD_TEST str ax
+        V86_UD_TEST arpl [bx+si],ax
+
+        RESTORE_HANDLER EXCEPTION_UD
         push    cs
         pop     ds
         mov     si,.v86_exit
@@ -1313,6 +1643,658 @@ V86start:
 .v86_unreal_possible:
         db      "Unreal mode should not be possible in V86!",10,0
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+        bits    16
+TestTask16:
+        ; Setup 16-bit interrupt gate for int 0x13
+        mov     ax,GDT_SEL_DATA16
+        mov     es,ax
+        mov     ds,ax
+
+        ; Save old interrupts
+        push    dword [IDT_BASE+EXCEPTION_GP*8]
+        push    dword [IDT_BASE+EXCEPTION_GP*8+4]
+        push    dword [IDT_BASE+EXCEPTION_NP*8]
+        push    dword [IDT_BASE+EXCEPTION_NP*8+4]
+        push    dword [IDT_BASE+0x13*8]
+        push    dword [IDT_BASE+0x13*8+4]
+        push    dword [IDT_BASE+0x14*8]
+        push    dword [IDT_BASE+0x14*8+4]
+
+        mov     di,IDT_BASE+0x13*8
+        mov     ebx,TestInt13
+        mov     ax,bx
+        stosw   ; offset low
+        mov     ax,GDT_SEL_ORIG16 ; segment selector
+        stosw
+        mov     ax,0xE600 ; type (present, DPL=3, 16-bit interrupt gate)
+        stosw
+        mov     eax,ebx
+        shr     eax,16
+        stosw
+
+        GET_LINEAR_BASE ebx
+        add     ebx,TestGP_16_32
+        mov     di,IDT_BASE+EXCEPTION_GP*8
+        mov     ax,bx
+        stosw   ; offset low
+        mov     ax,GDT_SEL_CODE32 ; segment selector
+        stosw
+        mov     ax,0x8E00 ; type (present, DPL=0, 32-bit interrupt gate)
+        stosw
+        mov     eax,ebx
+        shr     eax,16
+        stosw
+
+        mov     word [TSS16_BASE+TSS16_SS0],GDT_SEL_DATA16
+        mov     [TSS16_BASE+TSS16_SP0],sp
+
+        mov     ax,GDT_SEL_TSS16
+        ltr     ax
+
+        push    word GDT_SEL_UD16|3
+        push    word STACK2_TOP
+        push    word 0
+        push    word GDT_SEL_USER16|3
+        push    word Task16
+        iret
+ExitTestTask16:
+        mov     ax,GDT_SEL_DATA32
+        mov     ds,ax   ; reload DS
+
+        ; Restore interrupts
+        pop     dword [IDT_BASE+0x14*8+4]
+        pop     dword [IDT_BASE+0x14*8]
+        pop     dword [IDT_BASE+0x13*8+4]
+        pop     dword [IDT_BASE+0x13*8]
+        pop     dword [IDT_BASE+EXCEPTION_NP*8+4]
+        pop     dword [IDT_BASE+EXCEPTION_NP*8]
+        pop     dword [IDT_BASE+EXCEPTION_GP*8+4]
+        pop     dword [IDT_BASE+EXCEPTION_GP*8]
+
+        mov     ax,GDT_SEL_TSS
+        and     byte [GDT_BASE+GDT_SEL_TSS+5],0xfd ; clear BUSY flag
+        ltr     ax      ; reload task
+        retfd
+
+TI13_TEST1      EQU 0x1234
+TI13_EXIT       EQU 0x5ac3
+TI13_SETIOPL    EQU 0xb451
+TI13_FAIL       EQU 0xcd12
+
+%macro CHECK16_CC 1
+        j%1     %%ok
+        mov     bp,TI13_FAIL
+        int     0x13
+%%ok:
+%endmacro
+
+%macro CHECK16_EQ 2
+        cmp     %1,%2
+        CHECK16_CC e
+%endmacro
+
+        bits    32
+TestGP_16_32:
+        add     esp,4 ; pop error code
+        cmp     [esp],ebx
+        jne     .fail
+        mov     [esp],eax ; continuation address
+        cmp     word [esp+4],GDT_SEL_USER16|3
+        jne     .fail
+        cmp     dword [esp+12],STACK2_TOP ; ESP
+        cmp     word [esp+16],GDT_SEL_UD16|3 ; SS
+        jne     .fail
+        iret
+.fail:
+        add     word [esp],5 ; adjust return address for printing
+        mov     bp,[esp+4]
+        mov     [esp+2],bp ; CS
+        jmp     PModeFail
+        bits    16
+
+TestNP_16_16:
+        CHECK_EQ si,EXCEPTION_NP
+        jmp     Test16_16_Common
+TestGP_16_16:
+        CHECK_EQ si,EXCEPTION_GP
+Test16_16_Common:
+        mov     bp,sp
+        CHECK16_EQ [bp],cx ; error code
+        CHECK16_EQ [bp+2],bx ; IP
+        CHECK16_EQ word [bp+4],GDT_SEL_USER16|3 ; CS
+        CHECK16_EQ word [bp+8],dx ; SP
+        CHECK16_EQ word [bp+10],GDT_SEL_UD16|3 ; SS
+        mov     [bp+2],ax
+        add     sp,2
+        iret
+
+TestInt13:
+        cmp     bp,TI13_TEST1
+        je      .test1
+        cmp     bp,TI13_EXIT
+        je      .exit
+        cmp     bp,TI13_SETIOPL
+        je      .setiopl
+        push    word GDT_SEL_DATA16
+        pop     ds
+        push    dword 0
+        push    dword GDT_SEL_CODE32
+        GET_LINEAR_BASE ebp
+        add     ebp,PModeFail
+        push    ebp
+        iretd
+.exit:
+        add     sp,10   ; pop interrupt stack
+        jmp     ExitTestTask16
+.test1:
+        ; Check stack
+        mov     bp,sp
+        CHECK16_EQ [bp+0],ax
+        CHECK16_EQ word [bp+2],GDT_SEL_USER16|3
+
+        ; And our segment registers
+        mov     bp,cs
+        CHECK16_EQ bp,GDT_SEL_ORIG16
+        mov     bp,ss
+        CHECK16_EQ bp,GDT_SEL_DATA16
+        iret
+.setiopl:
+        and     word [esp+4],~(3<<EFLAGS_BIT_IOPL)
+        shl     ax,EFLAGS_BIT_IOPL
+        or      [esp+4],ax
+        not     bp
+        iret
+
+Fail16:
+        mov     bp,TI13_FAIL
+        int     0x13
+        jmp     Fail16
+
+Call16Entry:
+        mov     bp,sp
+        cmp     [bp+0],ax       ; IP
+        CHECK16_EQ word [bp+2],GDT_SEL_USER16|3 ; CS
+        CHECK16_EQ word [bp+4],0xabcd ; param 1
+        CHECK16_EQ word [bp+6],0x1234 ; param 2
+        CHECK16_EQ word [bp+8],STACK2_TOP-4 ; SP
+        CHECK16_EQ word [bp+10],GDT_SEL_UD16|3 ; SS
+        mov     bp,cs
+        CHECK16_EQ bp,GDT_SEL_ORIG16
+        mov     bp,ss
+        CHECK16_EQ bp,GDT_SEL_DATA16
+        mov     ds,bp ; A selector that's not available for user mode
+        retf 4
+
+Task16:
+        mov     ax,.cont1
+        mov     bp,TI13_TEST1
+        int     0x13
+.cont1:
+
+        ;
+        ; Test some #GP faults (through 32-bit interrupt gate)
+        ;
+%macro TEST_GP16_32 1+
+        mov     eax,%%cont
+        mov     ebx,%%inst
+%%inst:
+        %1
+        jmp     Fail16
+%%cont:
+%endmacro
+
+        TEST_GP16_32 cli
+        TEST_GP16_32 sti
+
+        ; Set IOPL=3 and check cli/sti again
+        mov     bp,TI13_SETIOPL
+        mov     al,3
+        int     0x13
+        cli
+        sti
+
+        push    word 0
+        popf
+        pushf
+        pop     ax
+        CHECK_EQ ax,EFLAGS_MASK_ALWAYS1|3<<EFLAGS_BIT_IOPL ; IOPL not changed
+
+
+        push    word ~EFLAGS_MASK_TF
+        popf
+        pushf
+        pop     ax
+        mov     bx,~(EFLAGS_MASK_ALWAYS0|EFLAGS_MASK_TF)
+        CHECK16_EQ ax,bx ; IOPL not changed, IF is changed
+
+        ;
+        ; Test 16/32-bit interrupt/trap gate behavior for IF
+        ;
+        jmp     .test_if
+.get_flags:
+        ; N.B. code must work in both 16- and 32-bit mode!
+        pushf
+        pop     ax
+        iret
+.test_if:
+        mov     bx,GDT_SEL_UD16|3
+        mov     ds,bx
+        lea     bx,[IDT_BASE+0x14*8]
+        mov     word [bx],.get_flags
+        mov     word [bx+2],GDT_SEL_ORIG16
+        mov     word [bx+4],0xE700 ; 16-bit trap gate, DPL=3
+        mov     word [bx+6],0
+
+        sti
+        mov     eax,0xABCDABCD
+        int     0x14
+        test    ax,EFLAGS_MASK_IF
+        CHECK16_CC nz ; IF not cleared
+        shr     eax,16
+        CHECK_EQ ax,0xABCD ; Really executed in 16-bit mode
+
+        mov     byte [bx+5],0xE6 ; 16-bit interrupt gate, DPL=3
+        mov     eax,0xABCDABCD
+        int     0x14
+        test    ax,EFLAGS_MASK_IF
+        CHECK16_CC z    ; IF cleared (in handler)
+        shr     eax,16
+        CHECK_EQ ax,0xABCD ; Really executed in 16-bit mode
+
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX ; DosBox doesn't like these?
+        je      .dbskip1
+
+        mov     word [bx+2],GDT_SEL_ORIG32 ; 32-bit selector
+        mov     byte [bx+5],0xEE ; 32-bit interrupt gate, DPL=3
+        mov     eax,0xABCDABCD
+        int     0x14
+        test    ax,EFLAGS_MASK_IF
+        CHECK16_CC z    ; IF cleared (in handler)
+        shr     eax,16
+        cmp     ax,0xABCD ; Really executed in 32-bit mode
+        CHECK16_CC nz
+
+        mov     byte [bx+5],0xEF ; 32-bit trap gate, DPL=3
+        mov     eax,0xABCDABCD
+        int     0x14
+        test    ax,EFLAGS_MASK_IF
+        CHECK16_CC nz    ; IF not cleared
+        shr     eax,16
+        cmp     ax,0xABCD ; Really executed in 32-bit mode
+        CHECK16_CC nz
+
+.dbskip1:
+
+        ; IF cleared from here on
+        cli
+
+        ; Restore IOPL=0
+        mov     bp,TI13_SETIOPL
+        xor     al,al
+        int     0x13
+
+        ; 16-bit call gate with parameters
+        mov     ax,.after_call16
+        push    0x1234
+        push    0xabcd
+        call    GDT_SEL_CALL16:0xabcd
+.after_call16:
+        CHECK16_EQ sp,STACK2_TOP ; parameters are gone from our stack (!)
+        mov     ax,ss
+        CHECK16_EQ ax,GDT_SEL_UD16|3
+        mov     ax,ds
+        CHECK16_EQ ax,0 ; cleared because the call gate loaded DS
+
+        ;
+        ; Test GP faults with 16-bit handler
+        ;
+
+        mov     ax,GDT_SEL_UD16|3
+        mov     ds,ax
+        lea     bx,[IDT_BASE+EXCEPTION_GP*8]
+        mov     word [bx],TestGP_16_16
+        mov     word [bx+2],GDT_SEL_ORIG16
+        mov     word [bx+4],0xE600
+        mov     word [bx+6],0
+
+%macro TEST_GP16_16 2+ ; error code, instruction
+        mov     ax,%%cont
+        mov     bx,%%inst
+        mov     cx,%1
+        mov     dx,sp
+%%inst:
+        %2
+        jmp     Fail16
+%%cont:
+%endmacro
+        mov     si,EXCEPTION_GP
+        TEST_GP16_16 0,cli
+        CHECK16_EQ sp,STACK2_TOP
+        push    GDT_SEL_ORIG16
+        push    Fail16
+        TEST_GP16_16 GDT_SEL_ORIG16,retf
+        add     sp,4
+        CHECK16_EQ sp,STACK2_TOP
+
+%macro TEST_GP16_16_RETF 3 ; cs,ip,error code
+        mov     di,sp
+        push    word %1
+        push    word %2
+        TEST_GP16_16 %3,retf
+        add     sp,4
+        CHECK16_EQ di,sp
+%endmacro
+
+        TEST_GP16_16_RETF 0,0,0 ; CS = 0
+        TEST_GP16_16_RETF GDT_SEL_UD16|3,0,GDT_SEL_UD16 ; Not a code segment
+        TEST_GP16_16_RETF GDT_SEL_USER16,0,GDT_SEL_USER16 ; RPL < CPL
+
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX ; Dosbox aborts with this command
+        je      .skip_gp_1
+        TEST_GP16_16 GDT_SEL_NP,call far [cs:.np_dest] ; #GP is raised because DPL is checked before present
+.skip_gp_1:
+
+        xor     si,si
+
+        ;
+        ; Test #NP
+        ;
+        lea     bx,[IDT_BASE+EXCEPTION_NP*8]
+        mov     word [bx],TestNP_16_16
+        mov     word [bx+2],GDT_SEL_ORIG16
+        mov     word [bx+4],0xE600
+        mov     word [bx+6],0
+
+        mov     si,EXCEPTION_NP
+        or      byte [GDT_BASE+GDT_SEL_NP+5],3<<GDT_ACCESS_BIT_DPL
+        TEST_GP16_16 GDT_SEL_NP,call far [cs:.np_dest]
+        CHECK16_EQ sp,STACK2_TOP
+
+        TEST_GP16_16_RETF GDT_SEL_NP|3,0,GDT_SEL_NP
+
+        xor     si,si
+
+        push    word ~EFLAGS_MASK_TF
+        popf
+        pushf
+        pop     ax
+        mov     bx,~(EFLAGS_MASK_ALWAYS0|EFLAGS_MASK_TF|EFLAGS_MASK_IF|3<<EFLAGS_BIT_IOPL)
+        mov     cx,bx
+        xor     cx,ax
+        CHECK16_EQ ax,bx ; IF/IOPL not changed
+
+
+        ; Done
+        mov     bp,TI13_EXIT
+        int     0x13
+        hlt
+.np_dest: dw 0xABCD,GDT_SEL_NP|3
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+        bits 32
+
+Test32GPHandler:
+        CHECK_EQ [esp],ecx ; error code
+        CHECK_EQ [esp+4],eax ; IP
+        add     esp,4
+        mov     [esp],ebx
+        iret
+
+TestGP32:
+        ; Can load NULL selector into every register
+        mov     ax,0
+        mov     ds,ax
+        mov     es,ax
+        mov     fs,ax
+        mov     gs,ax
+
+        mov     ax,GDT_SEL_DATA32
+        mov     ds,ax
+
+        SET_HANDLER EXCEPTION_GP,Test32GPHandler
+
+%macro TEST_GP_32 2+
+        mov     eax,%%instruction
+        mov     ebx,%%next
+        mov     ecx,%1
+%%instruction:
+        %2
+%%next:
+%endmacro
+
+        TEST_GP_32 0,mov edx,[es:0] ; Access through NULL selector
+
+        mov     dx,GDT_SEL_NULL2
+        TEST_GP_32 GDT_SEL_NULL2,mov es,dx
+
+        RESTORE_HANDLER EXCEPTION_GP
+        retf
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+%macro SET_TEST_PAGE 2
+        mov     dword [PD800+%1*4],%2|PT_MASK_W|PT_MASK_P
+%endmacro
+
+%macro PG_FLUSH 0
+        push    eax
+        mov     eax,cr3
+        mov     cr3,eax
+        pop     eax
+%endmacro
+
+TestPaging:
+        ;
+        ; Build page tables
+        ;
+
+        cld
+
+        mov     ax,GDT_SEL_DATA32
+        mov     ds,ax
+        mov     es,ax
+
+        mov     ebx,PAGING_BASE
+
+        ; Clear the used pages
+        mov     edi,ebx
+        mov     ecx,(PAGING_NEXT_PAGE-PAGING_BASE)/4
+        xor     eax,eax
+        rep     stosd
+
+        ; Each Page Directory Entry maps 4MB (1024 4K pages)
+        mov     dword [ebx],PD000|PT_MASK_W|PT_MASK_P
+        mov     dword [ebx+(0x80000000/(4096*1024))*4],PD800|PT_MASK_W|PT_MASK_P
+
+        ; Identity map first 1MB
+        mov     edi,PD000
+        mov     eax,PT_MASK_W|PT_MASK_P
+        mov     ecx,(1024*1024)/PAGE_SIZE
+.map0:
+        stosd
+        add     eax,PAGE_SIZE
+        dec     ecx
+        jnz     .map0
+
+        SET_TEST_PAGE 0,TEST_PAGE0
+        SET_TEST_PAGE 1,TEST_PAGE1
+        SET_TEST_PAGE 2,TEST_PAGE2
+
+        ; Enable paging
+        mov     cr3,ebx
+        mov     eax,cr0
+        bts     eax,31
+        mov     cr0,eax
+
+        call    TestPaging1
+
+        ; Disable paging
+        mov     eax,cr0
+        btc     eax,31
+        mov     cr0,eax
+
+        ret
+
+FillPage: ; EDI = page, AL = value
+        cld
+        mov     ah,al
+        push    ax
+        shl     eax,16
+        pop     ax
+        mov     ecx,PAGE_SIZE/4
+        rep     stosd
+        ret
+
+TestCrossRead:
+        mov     esi,TEST_PAGE0_VIRT+PAGE_SIZE-4
+        mov     ecx,5
+.loop:
+        mov     edx,[esi]
+        CHECK_EQ edx,eax
+        inc     esi
+        shrd    eax,ebx,8
+        ror     ebx,8
+        loop    .loop
+        ret
+
+PageFaultHandler:
+        cmp     edx,[esp] ; error code
+        je      .ok
+        test    edx,edx ; if sign-bit - allow different error code for now...
+        CHECK_CC s
+.ok:
+        CHECK_EQ eax,[esp+4] ; return address
+        mov     eax,cr2
+        CHECK_EQ eax,ecx ; linear address
+        mov     [esp+4],ebx
+        add     esp,4
+        iretd
+
+TestPaging1:
+        ; Initialize test pages
+        mov     edi,TEST_PAGE0_VIRT
+        mov     al,0xAB
+        call    FillPage
+        mov     edi,TEST_PAGE1_VIRT
+        mov     al,0xCD
+        call    FillPage
+        mov     edi,TEST_PAGE2_VIRT
+        mov     al,0xEF
+        call    FillPage
+
+        ; Some basic tests
+        CHECK_EQ dword [TEST_PAGE0_VIRT],0xabababab
+        CHECK_EQ dword [TEST_PAGE1_VIRT],0xcdcdcdcd
+        CHECK_EQ dword [TEST_PAGE2_VIRT],0xefefefef
+
+        ; Crossing a page
+        mov     eax,0xabababab
+        mov     ebx,0xcdcdcdcd
+        call    TestCrossRead
+
+        ; Now swap mapping of page 0 and 1
+        SET_TEST_PAGE 0,TEST_PAGE1
+        SET_TEST_PAGE 1,TEST_PAGE0
+        PG_FLUSH
+
+        ; Virtual cd cd cd cd | ab ab ab ab
+        mov     eax,0xcdcdcdcd
+        mov     ebx,0xabababab
+        call    TestCrossRead
+
+        ; Write and read back
+        mov     eax,0x12345678
+        ; Virtual cd cd cd 78 | 56 34 12 ab
+        mov     dword [TEST_PAGE0_VIRT+PAGE_SIZE-1],eax
+        CHECK_EQ dword [TEST_PAGE0_VIRT+PAGE_SIZE-1],eax
+        ; And check phsical pages
+        CHECK_EQ dword [TEST_PAGE0],0xab123456
+        CHECK_EQ dword [TEST_PAGE1+PAGE_SIZE-4],0x78cdcdcd
+
+        ; RMW across a page
+        add     dword [TEST_PAGE0_VIRT+PAGE_SIZE-2],0x01020304
+        ; Virtual cd cd d1 7b | 58 35 12 ab
+        CHECK_EQ dword [TEST_PAGE0_VIRT+PAGE_SIZE-2],0x35587bd1
+        mov     eax,[TEST_PAGE0]
+        mov     ebx,[TEST_PAGE1+PAGE_SIZE-2]
+        CHECK_EQ dword [TEST_PAGE0],0xab123558
+        CHECK_EQ dword [TEST_PAGE1+PAGE_SIZE-4],0x7bd1cdcd
+
+        ; Write to physical page and see that it's read back virtually
+        mov     dword [TEST_PAGE0],0x11223344
+        mov     dword [TEST_PAGE1+PAGE_SIZE-4],0x55667788
+        CHECK_EQ dword [TEST_PAGE0_VIRT+PAGE_SIZE-2],0x33445566
+
+
+        ; movsd across page boundary
+        mov     dword [TEST_PAGE0],0x11223344
+        mov     dword [TEST_PAGE1+PAGE_SIZE-4],0x55667788
+        mov     esi,TEST_PAGE0_VIRT+PAGE_SIZE-2
+        mov     edi,TEST_PAGE0_VIRT+PAGE_SIZE-3
+        movsd
+        mov     eax,0x44556688
+        mov     ebx,0x11223333
+        call    TestCrossRead
+
+        ; Code crossing boundary
+        mov     word [TEST_PAGE0],0xc32a ; (immediate) / ret
+        mov     word [TEST_PAGE1+PAGE_SIZE-2],0xb090 ; nop / mov al,imm8
+        mov     edx,TEST_PAGE0_VIRT+PAGE_SIZE-2
+        mov     eax,0x99999999
+        call    edx
+        CHECK_EQ eax,0x9999992a
+
+        ;
+        ; Check page faults
+        ;
+        SET_HANDLER EXCEPTION_PF,PageFaultHandler
+
+        GET_LINEAR_BASE ebp ; Keep linear base in EBP
+
+%macro CHECK_PF 3+ ; CR2 / error code
+        lea     eax,[ebp+%%inst]
+        lea     ebx,[ebp+%%after]
+        mov     ecx,%1
+        mov     edx,%2
+%%inst:
+        %3
+        call    PModeFail
+%%after:
+%endmacro
+
+        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,PT_MASK_W,mov dword [TEST_PAGE2_VIRT+PAGE_SIZE-3],0x01020304
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX
+        je      .dbskip1 ; Oops! Write does happen with DosBox
+        mov     eax,dword [TEST_PAGE2_VIRT+PAGE_SIZE-4]
+        CHECK_EQ eax,0xefefefef
+
+        mov     edi,TEST_PAGE2_VIRT+PAGE_SIZE-2
+        mov     esi,SCRATCH
+        mov     dword [esi],0x11223344
+        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,PT_MASK_W,movsd
+        CHECK_EQ dword [TEST_PAGE2_VIRT+PAGE_SIZE-4],0xefefefef
+
+        ; TODO: Probably shouldn't have W-bit set here, but bochs does..
+        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,1<<31,add dword [edi],0x11111111
+        CHECK_EQ dword [TEST_PAGE2_VIRT+PAGE_SIZE-4],0xefefefef
+
+        ; PF with pop relative to ESP
+        mov     esi,esp
+        lea     edi,[esp+1024*1024+4]
+        CHECK_PF edi,PT_MASK_W,pop dword [ds:esp+1024*1024]
+        CHECK_EQ esi,esp
+
+.dbskip1:
+        ; Now a read
+        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,0,mov eax,dword [TEST_PAGE2_VIRT+PAGE_SIZE-3]
+
+        RESTORE_HANDLER EXCEPTION_PF
+
+        ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+        bits 16
 
         times ROM_SIZE-16-($-$$) hlt
 

@@ -34,7 +34,12 @@ extern const char* const CPUExceptionNumberText[];
 
 static constexpr int ExceptionNone = -1;
 static constexpr int ExceptionNumberMask = 0xff;
-static constexpr int ExceptionHardwareMask = 0x100;
+
+static constexpr int ExceptionTypeShift = 8;
+static constexpr int ExceptionTypeSW = 0 << ExceptionTypeShift;
+static constexpr int ExceptionTypeCPU = 1 << ExceptionTypeShift;
+static constexpr int ExceptionTypeHW = 2 << ExceptionTypeShift;
+static constexpr int ExceptionTypeMask = 3 << ExceptionTypeShift;
 
 class CPUException : public std::exception {
 public:

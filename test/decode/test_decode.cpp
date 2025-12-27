@@ -89,6 +89,8 @@ void TestDecode16(CPUModel model)
     // 386+
     //
     constexpr const DecodeTestCase t386[] = {
+        { "0F03D2", "LSL\tDX, DX" }, // 286+
+        { "660F024606", "LAR\tEAX, [BP+0x06]" }, // 286+
         { "0F01E0", "SMSW\tAX" }, // 286+
         { "0F00C8", "STR\tAX" }, // 286+
         { "8ED8", "MOV\tDS, AX" },
@@ -149,6 +151,9 @@ void TestDecode32(CPUModel model)
         { "66621D00000200", "BOUND\tBX, [0x00020000]" },
         { "66C8010000", "ENTER\t0x0001, 0x00" },
         { "0F00CB", "STR\tEBX" },
+        { "36FF8074440580", "INC\tDWORD [SS:EAX-0x7FFABB8C]" },
+        { "8322FE", "AND\tDWORD [EDX], 0xFFFFFFFE" },
+        { "FF96080E0180", "CALL\tDWORD [ESI-0x7FFEF1F8]" },
     };
 
     RunTests(cpuInfo, t386);
@@ -157,10 +162,10 @@ void TestDecode32(CPUModel model)
 int main()
 {
     try {
-        // constexpr const DecodeTestCase tests[] = {
-        //     { "67668C6199", "MOV\t[ECX-0x67], FS" }, // N.B. unused operand-size prefix
-        // };
-        // RunTests(CPUInfo { CPUModel::i80386, 2 }, tests);
+        //constexpr const DecodeTestCase tests[] = {
+        //    { "FF96080E0180", "CALL\tDWORD [ESI+0x8001E080]" },
+        //};
+        //RunTests(CPUInfo { CPUModel::i80386, 4 }, tests);
 
         TestDecode16(CPUModel::i8088);
         TestDecode16(CPUModel::i8086);

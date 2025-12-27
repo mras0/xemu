@@ -14,12 +14,27 @@ constexpr uint8_t SD_ACCESS_MASK_DPL = 3 << SD_ACCESS_BIT_DPL;
 constexpr uint8_t SD_ACCESS_MASK_P = 1 << 7; // Present
 
 constexpr uint8_t SD_ACCESS_MASK_TYPE = 0xF; // For system segment descriptors
-constexpr uint8_t SD_TYPE_TASK16_AVAILABLE = 0x1;
-constexpr uint8_t SD_TYPE_LDT = 0x2;
-constexpr uint8_t SD_TYPE_TASK16_BUSY = 0x3;
-constexpr uint8_t SD_TYPE_TASK32_AVAILABLE = 0x9;
-constexpr uint8_t SD_TYPE_TASK32_BUSY = 0xB;
-constexpr uint8_t SD_TYPE_CALL32 = 0xC; // Call-gate descriptor
+
+enum : uint8_t {
+    SD_TYPE_RESERVED_0,        // 0 0b0000
+    SD_TYPE_TASK16_AVAILABLE,  // 1 0b0001
+    SD_TYPE_LDT,               // 2 0b0010
+    SD_TYPE_TASK16_BUSY,       // 3 0b0011
+    SD_TYPE_CALL16,            // 4 0b0100
+    SD_TYPE_TASK_GATE,         // 5 0b0101
+    SD_TYPE_INT16,             // 6 0b0110
+    SD_TYPE_TRAP16,            // 7 0b0111
+    SD_TYPE_RESERVED_8,        // 8 0b1000
+    SD_TYPE_TASK32_AVAILABLE,  // 9 0b1001
+    SD_TYPE_RESERVEDA,         // A 0b1010
+    SD_TYPE_TASK32_BUSY,       // B 0b1011
+    SD_TYPE_CALL32,            // C 0b1100
+    SD_TYPE_RESERVED_D,        // D 0b1101
+    SD_TYPE_INT32,             // E 0b1110
+    SD_TYPE_TRAP32,            // F 0b1111
+};
+constexpr uint8_t SD_TYPE_TSS_BUSY_MASK = 0x2;
+constexpr uint8_t SD_TYPE_TSS_32BIT_MASK = 0x8;
 
 constexpr uint8_t SD_FLAGS_MASK_L = 1 << 1; // Long-mode code flag
 constexpr uint8_t SD_FLAGS_MASK_DB = 1 << 2; // DB: Size (0 = 16-bit, 1 = 32-bit)
@@ -72,6 +87,13 @@ struct SegmentDescriptor {
         return (access & (SD_ACCESS_MASK_S | SD_ACCESS_MASK_E)) == (SD_ACCESS_MASK_S | SD_ACCESS_MASK_E);
     }
 
+    bool isConformingCodeSegment() const
+    {
+        if (!isCodeSegment())
+            return false;
+        return (access & SD_ACCESS_MASK_DC) != 0;
+    }
+
     void setRealModeCode(uint16_t value)
     {
         *this = fromU64(toRaw(0xffff, static_cast<uint64_t>(value) << 4, SD_ACCESS_MASK_S | SD_ACCESS_MASK_E | SD_ACCESS_MASK_RW | SD_ACCESS_MASK_P, 0));
@@ -112,5 +134,7 @@ template <>
 struct std::formatter<SegmentDescriptor> : std::formatter<const char*> {
     std::format_context::iterator format(const SegmentDescriptor& sd, std::format_context& ctx) const;
 };
+
+extern const char* const SdTypeNames[16];
 
 #endif

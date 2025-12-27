@@ -163,12 +163,12 @@ void CGA::impl::render()
         return;
 
     const auto startAddress = mc6845Registers_[MC6845RegisterIndex::StartAddressH] << 8 | mc6845Registers_[MC6845RegisterIndex::StartAddressL];
-    if (startAddress)
-        throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:02X} startAddress=0x{:X}", mcr_, startAddress) };
-
-    auto vidMem = &videoMem_.data()[0];
 
     if (mcr_ & MCR_MASK_GRAPHICS) {
+        if (startAddress)
+            throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:02X} startAddress=0x{:X}", mcr_, startAddress) };
+        auto vidMem = &videoMem_.data()[0];
+
         const int screenH = 200;
         if (mcr_ & MCR_MASK_HIRES) {
             const int screenW = 640;
@@ -218,6 +218,10 @@ void CGA::impl::render()
         const int screenH = textH * charH;
         pixels_.resize(screenW * screenH);
 
+        if (static_cast<size_t>(startAddress + textW * textH * 2) > videoMem_.size())
+            throw std::runtime_error { std::format("TODO: CGA render with mcr=0x{:02X} startAddress=0x{:X}", mcr_, startAddress) };
+        auto vidMem = &videoMem_.data()[startAddress];
+
         for (int ty = 0, bufIdx = 0; ty < textH; ++ty) {
             for (int tx = 0; tx < textW; ++tx, bufIdx += 2) {
                 const auto ch = vidMem[bufIdx];
@@ -258,6 +262,7 @@ std::uint8_t CGA::impl::inU8(uint16_t port, uint16_t)
     uint8_t value = 0;
     switch (port) {
     case 0x3D5:
+    case 0x3DF:
         std::println("CGA: Warning read from port {:04X}", port);
         return 0;
     case 0x3DA:

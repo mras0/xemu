@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include "opcodes.h"
 #include "address.h"
 #include "cpu_registers.h"
@@ -106,8 +107,11 @@ struct InstructionDecodeResult {
 };
 
 InstructionDecodeResult Decode(const CPUInfo& cpuInfo, std::function<std::uint8_t()> instructionFetch);
-std::string FormatDecodedInstruction(const InstructionDecodeResult& ins, const Address& addr);
-std::string FormatDecodedInstructionFull(const InstructionDecodeResult& ins, const Address& addr);
+
+using LabelLookupFunc = std::function<std::string (std::uint64_t)>;
+
+std::string FormatDecodedInstruction(const InstructionDecodeResult& ins, const Address& addr, LabelLookupFunc labelLookup = {});
+std::string FormatDecodedInstructionFull(const InstructionDecodeResult& ins, const Address& addr, LabelLookupFunc labelLookup = {});
 
 std::string ModrmString(uint8_t modrm);
 bool EAIsMemory(DecodedEAType t);

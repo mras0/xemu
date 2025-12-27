@@ -109,19 +109,26 @@ private:
         uint8_t mode;
     } channels_[4];
 
+    uint8_t pagePortIndex(uint16_t port)
+    {
+        assert((port & 0xfff0) == 0x80);
+        return (port & 7) == 7 ? 0 : (port & 3) == 3 ? 1
+            : (port & 3) == 1                        ? 2
+                                                     : 3;
+    }
+
     std::string desc() const
     {
         return std::format("DMA{}-{}: ", channelCountOffset_, channelCountOffset_ + 3);
     }
 
     void internalWrite8(std::uint16_t port, std::uint16_t regNum, std::uint8_t value);
+    uint8_t internalRead8(std::uint16_t regNum);
 };
 
-std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
+std::uint8_t i8237a_DMAController::impl::internalRead8(std::uint16_t regNum)
 {
-    if (wordMode_)
-        throw std::runtime_error { std::format("{}Unsupported 8-bit read from register {:02X} (offset {}) -- wordMode!", desc(), port, offset) };
-    switch (offset) {
+    switch (regNum) {
     case 0x00:
     case 0x01:
     case 0x02:
@@ -130,26 +137,49 @@ std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t 
     case 0x05:
     case 0x06:
     case 0x07: {
-        auto value = offset & 1 ? channels_[offset >> 1].currentCount : channels_[offset >> 1].currentAddress;
+        auto value = regNum & 1 ? channels_[regNum >> 1].currentCount : channels_[regNum >> 1].currentAddress;
         if (msbFlipFlop_)
             value >>= 8;
         msbFlipFlop_ = !msbFlipFlop_;
         return static_cast<uint8_t>(value);
     }
     case 0x08:
-        //Status register
-        //Should be: REQ3|REQ2|REQ1|REQ0|TC3|TC2|TC1|TC0 (TC3-0 are cleared on read)
+        // Status register
+        // Should be: REQ3|REQ2|REQ1|REQ0|TC3|TC2|TC1|TC0 (TC3-0 are cleared on read)
         std::println("{}TODO read of status register, just returning 1 (TC0)", desc());
         return 1; // Return TC0 for IBM PC XT BIOS
     default:
-        throw std::runtime_error { std::format("{}Unsupported read from register {:02X} (offset {})", desc(), port, offset) };
+        throw std::runtime_error { std::format("{}Unsupported read from register {:02X}", desc(), regNum) };
     }
+}
+
+std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
+{
+    if (port >= 0x80 && port <= 0x8F) {
+        const auto idx = pagePortIndex(port);
+        return channels_[idx].page;
+    }
+
+    if (wordMode_) {
+        if (!(offset & 1))
+            return internalRead8(offset >> 1);
+        throw std::runtime_error { std::format("{}Unsupported 8-bit read from register {:02X} (offset {}) -- wordMode!", desc(), port, offset) };
+    }
+    return internalRead8(offset);
 }
 
 std::uint16_t i8237a_DMAController::impl::inU16(std::uint16_t port, std::uint16_t offset)
 {
-    if (!wordMode_)
+    if (!wordMode_ || (port & 0xfff0) == 0x80)
         return IOHandler::inU16(port, offset);
+
+//    if (!(offset & 1)) {
+//        const uint16_t regNum = offset >> 1;
+//        if (regNum >= firstActionReg && (value >> 8) == 0) {
+//            internalWrite8(port, regNum, static_cast<uint8_t>(value));
+//            return;
+//        }
+//    }
 
     throw std::runtime_error { std::format("{}Unsupported 16-bit read from register {:02X} (offset {})!", desc(), port, offset) };
 }
@@ -191,9 +221,7 @@ void i8237a_DMAController::impl::internalWrite8(std::uint16_t port, std::uint16_
 void i8237a_DMAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value)
 {
     if (port >= 0x80 && port <= 0x8F) {
-        const auto idx = (port & 7) == 7 ? 0 : (port & 3) == 3 ? 1
-            : (port & 3) == 1                                  ? 2
-                                                               : 3;
+        const auto idx = pagePortIndex(port);
         std::println("{}Channel {} setting page register to {:02x}",   desc(), idx, value);
         channels_[idx].page = value;
         return;

@@ -3,6 +3,12 @@
 #include <format>
 #include <print>
 
+#if 0
+#define LOG(...) std::println(__VA_ARGS__)
+#else
+#define LOG(...)
+#endif
+
 static constexpr uint8_t ICW1_MASK_ICW4 = 1 << 0;
 static constexpr uint8_t ICW1_MASK_SINGLE = 1 << 1; // Single (no ICW3)/cascade mode
 static constexpr uint8_t ICW1_MASK_INTERVAL4 = 1 << 2; // Call interval 4/8
@@ -58,23 +64,39 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
             // OCW2/3 depending on bit3
             if (value & 8) {
                 // OCW3
-                switch (value) {
-                case 0b1010: // read ISR
+                switch (value & 7) {
+                case 0b010: // read ISR
                     nextReg_ = 0;
                     return;
-                case 0b1011: // read IRR
+                case 0b011: // read IRR
                     nextReg_ = 1;
                     return;
                 }
+                //if (value == 0x6b || value == 0x4a) {
+                //    std::println("{}: TODO OCW3 {:X} written?!", name, value);
+                //    return;
+                //}
             } else {
                 // OCW2
                 if (value == 0x20) { // non-specific EOI
                     // The highest request level is reset from the IRR when an interrupt is acknowledged.
-                    isr_ = 0; // XXX
+                    for (int i = 8; i--;) {
+                        if (isr_ & (1 << i)) {
+                            isr_ &= ~(1 << i);
+                            return;
+                        }
+                    }
+                    std::println("{}: TODO: non-specific EOI with ISR {:02X}", name, isr_);
+                    return;
+                }
+                const auto level = value & 7;
+                if ((value & 0xf0) == 0x60) {
+                    LOG("{}: OCW2 Specific EOI {:02X} to ISR {:02X}, level = {} -> {:02X}", name, value, isr_, level, isr_ & ~(1 << level));
+                    isr_ &= ~(1 << level);
                     return;
                 }
             }
-            throw std::runtime_error { std::format("{}: Unsupported write to OCW{}: {:02X}", name, value & 8 ? 3 : 2, value) };
+            throw std::runtime_error { std::format("{}: Unsupported write to OCW{}: {:02X} {:08b}", name, value & 8 ? 3 : 2, value, value) };
         }
     } else {
         // Data
@@ -114,7 +136,7 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
             if (!icwCnt_)
                 std::println("{}: Ready!", name);
         } else {
-            std::println("{}: IMR={:02X} 0b{:08b}", name, value, value);
+            LOG("{}: IMR={:02X} 0b{:08b}", name, value, value);
             imr_ = value;
         }
     }

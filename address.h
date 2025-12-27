@@ -6,7 +6,7 @@
 
 class Address {
 public:
-    constexpr explicit Address()
+    constexpr Address()
         : segment_ { 0 }
         , offset_ { UINT64_MAX }
         , offsetSize_ { 8 }
@@ -24,6 +24,8 @@ public:
     constexpr std::uint16_t segment() const { return segment_; }
     constexpr std::uint64_t offset() const { return offset_; }
     constexpr std::uint8_t offsetSize() const { return offsetSize_; }
+
+    constexpr bool operator==(const Address& rhs) const = default;
 
     Address operator+(int64_t incr) const
     {

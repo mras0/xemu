@@ -133,14 +133,17 @@ add_executable(xemu
     # Devices
     devs/dma_handler.h
     devs/cga.cpp devs/cga.h devs/cga_font.h
+    devs/vga.cpp devs/vga.h
     devs/i8259a_pic.cpp devs/i8259a_pic.h
     devs/i8253_pit.cpp devs/i8253_pit.h
     devs/nec765_floppy_controller.cpp devs/nec765_floppy_controller.h
     devs/i8237a_dma_controller.cpp devs/i8237a_dma_controller.h
     devs/i8042_ps2_controller.cpp devs/i8042_ps2_controller.h
+    devs/ata_controller.cpp devs/ata_controller.h
     )
 
 target_link_libraries(xemu xemu_core)
 add_dependencies(xemu bios_rom videobios_rom)
 
 add_subdirectory(test)
+add_subdirectory(tools)

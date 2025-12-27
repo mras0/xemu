@@ -6,7 +6,9 @@
 
 std::uint8_t IOHandler::inU8(std::uint16_t port, std::uint16_t)
 {
-    throw std::runtime_error { std::format("Unspported 8-bit I/O input from port 0x{:04X}", port) };
+    std::println("Unspported 8-bit I/O input from port 0x{:04X}", port);
+    THROW_FLIPFLOP();
+    return 0xFF;
 }
 
 std::uint16_t IOHandler::inU16(std::uint16_t port, std::uint16_t offset)
@@ -23,7 +25,8 @@ std::uint32_t IOHandler::inU32(std::uint16_t port, std::uint16_t offset)
 
 void IOHandler::outU8(std::uint16_t port, std::uint16_t, std::uint8_t value)
 {
-    throw std::runtime_error { std::format("Unspported 8-bit I/O output to port 0x{:04X} value=0x{:02X}", port, value) };
+    std::println("Unspported 8-bit I/O output to port 0x{:04X} value=0x{:02X}", port, value);
+    THROW_FLIPFLOP();
 }
 
 void IOHandler::outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value)
@@ -75,6 +78,8 @@ T SystemBus::read(std::uint64_t addr)
         }
     }
     std::println("Read of size {} from unmmaped address {:X}", sizeof(T), addr);
+    if (addr == 0xC9FF8)
+        throw std::runtime_error { "XXX" };
     if constexpr (sizeof(T) == 1)
         return 0xF4; // HLT opcode
     else
@@ -88,11 +93,10 @@ void SystemBus::write(std::uint64_t addr, T value)
     addr &= addressMask_;
 
     #if 0
-    const auto watchAddr = 0x00033046;
+    const auto watchAddr = 0x0038FFFD;
     if (addr <= watchAddr && addr + sizeof(T) - 1 >= watchAddr) {
-        std::println("Write of size {} to address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2);
-        __nop();
-        //throw std::runtime_error { "FIXME" };
+        std::println(">>>>>>>>> Write of size {} to address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2);
+        THROW_ONCE();
     }
     #endif
 
@@ -108,8 +112,9 @@ void SystemBus::write(std::uint64_t addr, T value)
             ah->handler->writeU32(addr, addr - ah->base, value);
         }
     } else {
+        THROW_ONCE();
         std::println("Write of size {} to unmmaped address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T)*2);
-        //if (addr != 0xb0000)
+        //if (addr <1024*1024)
         //    throw std::runtime_error { std::format("Write of size {} to unmmaped address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2) };
     }
 }

@@ -1,4 +1,4 @@
-BUILD_ROM(test_rom386)
+BUILD_ROM(test_rom386 DEPENDS gdt.inc)
 
 add_executable(test_rom386 test_rom386.cpp)
 target_link_libraries(test_rom386 xemu_core)

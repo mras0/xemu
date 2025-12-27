@@ -219,7 +219,8 @@ Int13h_DiskInt:
 ;; Int 15h / Memory detection
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 Int15h_Memory:
-        ; TODO: Provide one or more options here
+        cmp     ah,0x88         ; GET EXTENDED MEMORY SIZE (286+)
+        je      .getextmem
         cmp     ax,0xE820       ; GET SYSTEM MEMORY MAP
         je      .ignore
         cmp     ax,0x2403       ; QUERY A20 GATE SUPPORT
@@ -228,13 +229,33 @@ Int15h_Memory:
         je      .ignore
         cmp     ax,0xE801       ; GET MEMORY SIZE FOR >64M CONFIGURATIONS
         je      .ignore
-        cmp     ah,0x88         ; GET EXTENDED MEMORY SIZE (286+)
-        je      .ignore
         cmp     ah,0x53         ; APM
         je      .ignore
+        cmp     ah,0x4F         ; Keyboard intercept
+        je      .ignore
+        cmp     ah,0x91         ; Keyboard ...
+        je      .ignore
+        cmp     ah,0x41         ; Wait on external event
+        je      .notsup
+        cmp     ah,0x87         ; Copy extended memory
+        je      .notsup
+        cmp     ah,0xc2         ; PS/2
+        je      .notsup
         jmp     FatalError
 .ignore:
         iret
+.notsup:
+        stc
+        mov     ah,0xff
+        retf 2
+.getextmem:
+        push    ds
+        mov     ax,BDA_SEG
+        mov     ds,ax
+        mov     ax,[bda_tempExtMem]
+        pop     ds
+        clc
+        retf 2
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Int 16h / Keyboard
@@ -257,10 +278,16 @@ Int16h_Keyboard:
         mov     ds,bx
         cmp     ah,0x92 ; Keyb.cmd capabilities check, just ignore
         je      .out
+        cmp     ah,0x11 ; Check for enhanced keystroke
+        je      .out
+        cmp     ah,0x55 ; MS-DOS
+        je      .out
         cmp     ah,0x00
         je      .get
         cmp     ah,0x01
         je      .check
+        cmp     ah,0x02
+        je      .shift_flags
         jmp     FatalError
 .out:
         pop     ds
@@ -277,6 +304,9 @@ Int16h_Keyboard:
         jmp     .out
 .check:
         call    KeyboardPeek
+        jmp     .out
+.shift_flags:
+        mov     al,[bda_kbdStatus1]
         jmp     .out
 
 KBD_DATA        EQU 0x60
@@ -494,6 +524,12 @@ Int19h_WarmReset:
         mov     al,10
         call    PutChar
 
+        call    DetectExtMem
+        mov     [bda_tempExtMem],ax
+        call    PutWordDec
+        mov     si,MsgExtended
+        call    PutStringCS
+
         ;
         ; Equipment flag
         ;
@@ -607,6 +643,49 @@ Int19h_WarmReset:
         xor     ax,ax
         int     0x16
         jmp     .doboot
+
+
+        cpu 386
+DetectExtMem:
+        ; A20 enable
+        mov     al,2
+        out     0x92,al
+
+        ; Load GDT + selector
+        lgdt    [cs:.desc]
+        mov     eax,cr0
+        or      al,1
+        mov     cr0,eax
+        mov     bx,8
+        mov     es,bx
+        and     al,0xfe
+        mov     cr0,eax
+
+        mov     ebx,1024*1024
+        mov     cx,0x55aa
+.detect:
+        mov     word [es:ebx],cx
+        cmp     word [es:ebx],cx
+        jne     .done
+        add     ebx,64*1024
+        jmp     .detect
+.done:
+
+        ; A20 disable
+        xor     al,al
+        out     0x92,al
+        mov     eax,ebx
+        sub     eax,1024*1024
+        shr     eax,10
+        ret
+.gdt:
+        dd      0,0
+        dd      0x0000ffff,0x00cf9200
+.desc:
+        dw      .desc-.gdt-1
+        dd      BIOS_SEG*16+.gdt
+
+        cpu     8086
 
 PIC1_COMMAND    EQU 0x20
 PIC1_DATA       EQU 0x21
@@ -726,6 +805,7 @@ Int08h_TimerIRQ:
 
 MsgHello: db "Dummy BIOS starting...",10,0
 MsgKB: db " KB",13,0
+MsgExtended: db " KB extended memory detected",10,0
 MsgNumDrives: db " drive(s) detected",10,0
 MsgNumHDs: db " fixed disk(s) detected",10,0
 MsgTryingDrive db "Booting from 0x",0
