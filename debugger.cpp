@@ -1,7 +1,6 @@
 #include "debugger.h"
 #include "util.h"
 
-#include <iostream>
 #include <string_view>
 #include <optional>
 #include <print>
@@ -114,19 +113,19 @@ void HexDump(Address addr, size_t size, std::function<std::optional<std::uint8_t
         for (size_t i = 0; i < here; ++i)
             buffer[i] = peek(offset++);
 
-        std::print("{} ", addr);
+        std::print(stderr, "{} ", addr);
         for (size_t i = 0; i < here; ++i) {
             if (buffer[i])
-                std::print(" {:02x}", *buffer[i]);
+                std::print(stderr, " {:02x}", *buffer[i]);
             else
-                std::print(" ??");
+                std::print(stderr, " ??");
         }
         for (size_t i = here; i < incr; ++i)
-            std::print("   ");
-        std::print("  ");
+            std::print(stderr, "   ");
+        std::print(stderr, "  ");
         for (size_t i = 0; i < here; ++i)
-            std::print("{}", buffer[i] && *buffer[i] >= ' ' && *buffer[i] < 127 ? static_cast<char>(*buffer[i]) : '.');
-        std::print("\n");
+            std::print(stderr, "{}", buffer[i] && *buffer[i] >= ' ' && *buffer[i] < 127 ? static_cast<char>(*buffer[i]) : '.');
+        std::print(stderr, "\n");
         addr += here;
         size -= here;
     }
@@ -637,11 +636,13 @@ Debugger::Debugger(CPU& cpu, SystemBus& bus)
 }
 
 
-void Debugger::initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset)
+void Debugger::initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset, uint8_t addressSize)
 {
     assert(static_cast<uint32_t>(sr) <= 6);
+    if (!addressSize)
+        addressSize = static_cast<uint8_t>(cpu_.protectedMode() && !cpu_.vm86() ? 4 : 2);
     ms.sr = sr;
-    ms.address = Address { cpu_.sregs_[sr], offset, static_cast<uint8_t>(cpu_.protectedMode() && !cpu_.vm86() ? 4 : 2) };
+    ms.address = Address { cpu_.sregs_[sr], offset, addressSize };
 }
 
 uint64_t Debugger::toPhys(uint64_t linearAddress)
@@ -715,12 +716,12 @@ void Debugger::check(void)
         if (--traceCount_ == 0)
             activate();
         else
-            cpu_.trace();
+            cpu_.trace(stderr);
     }
     checkBreakPoint(autoBreakPoint_);
     for (size_t i = 0; i < maxBreakPoints; ++i) {
         if (checkBreakPoint(breakPoints_[i]))
-            std::println("Breakpoint {} hit", i);
+            std::println(stderr, "Breakpoint {} hit", i);
     }
     if (active_)
         commandLoop();
@@ -729,12 +730,20 @@ void Debugger::check(void)
 void Debugger::commandLoop()
 {
     std::string line;
-    cpu_.trace();
+    std::fflush(stdout);
+    cpu_.trace(stderr);
     for (;;) {
-        std::cout << "> " << std::flush;
-        if (!std::getline(std::cin, line)) {
-            std::println("getline failed");
-            exit(0);
+        std::print(stderr, "> ");
+        line.clear();
+        for (;;) {
+            char buffer[256];
+            if (!fgets(buffer, sizeof(buffer), stdin)) {
+                std::println(stderr, "Could not read from stdin");
+                return;
+            }
+            line += buffer;
+            if (!line.empty() && line.back() == '\n')
+                break;
         }
         line = TrimString(line);
         if (line.empty())
@@ -743,7 +752,7 @@ void Debugger::commandLoop()
             if (!handleLine(line))
                 break;
         } catch (const std::exception& e) {
-            std::println("{}", e.what());
+            std::println(stderr, "{}", e.what());
         }
     }
 
@@ -768,7 +777,7 @@ void Debugger::addPhysicalBreakPoint(std::uint64_t physicalAddress)
     auto& bp = getFreeBreakPoint();
     bp.type = BreakPoint::Type::PHYSICAL;
     bp.address = physicalAddress;
-    std::println("Breakpoint {} added for physical address {:X}", &bp - breakPoints_, physicalAddress);
+    std::println(stderr, "Breakpoint {} added for physical address {:X}", &bp - breakPoints_, physicalAddress);
 }
 
 void Debugger::addBreakPoint(std::uint16_t segment, std::uint64_t offset)
@@ -777,7 +786,7 @@ void Debugger::addBreakPoint(std::uint16_t segment, std::uint64_t offset)
     bp.type = BreakPoint::Type::LOGICAL;
     bp.seg = segment;
     bp.address = offset;
-    std::println("Breakpoint {} added for {:04X}:{:04X}", &bp - breakPoints_, bp.seg, bp.address);
+    std::println(stderr, "Breakpoint {} added for {:04X}:{:04X}", &bp - breakPoints_, bp.seg, bp.address);
 }
 
 void Debugger::registerFunction(const std::string& name, const FunctionCallback& callback)
@@ -865,7 +874,7 @@ bool Debugger::handleLine(const std::string& line)
             auto n = parser.getNumber();
             if (!n)
                 break;
-            std::println("{:08X}`{:08X} 0b{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b} {} {}", *n >> 32, *n & 0xffffffff, (*n >> 56) & 0xff, (*n >> 48) & 0xff, (*n >> 40) & 0xff, (*n >> 32) & 0xff, (*n >> 24) & 0xff, (*n >> 16) & 0xff, (*n >> 8) & 0xff, *n & 0xff, *n, static_cast<int64_t>(*n));
+            std::println(stderr, "{:08X}`{:08X} 0b{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b}`{:08b} {} {}", *n >> 32, *n & 0xffffffff, (*n >> 56) & 0xff, (*n >> 48) & 0xff, (*n >> 40) & 0xff, (*n >> 32) & 0xff, (*n >> 24) & 0xff, (*n >> 16) & 0xff, (*n >> 8) & 0xff, *n & 0xff, *n, static_cast<int64_t>(*n));
         }
         return true;
     }
@@ -899,7 +908,7 @@ bool Debugger::handleLine(const std::string& line)
             if (*nl < 1000)
                 return *nl;
             else
-                std::print("Too many lines {}\n", *nl);
+                std::print(stderr, "Too many lines {}\n", *nl);
         }
         return defaultNumLines;
     };
@@ -940,7 +949,7 @@ bool Debugger::handleLine(const std::string& line)
 
     if (cmd == "b") {
         DebuggerMemState ms;
-        initMemState(ms, SREG_CS, 0);
+        initMemState(ms, SREG_CS, 0, 4);
         if (!getAddress(ms))
             throw std::runtime_error { "Address missing" };
         addBreakPoint(ms.address.segment(), ms.address.offset());
@@ -956,10 +965,10 @@ bool Debugger::handleLine(const std::string& line)
             case BreakPoint::Type::INACTIVE:
                 break;
             case BreakPoint::Type::PHYSICAL:
-                std::println("0x{:X} {:06X} physical", i, bp.address);
+                std::println(stderr, "0x{:X} {:06X} physical", i, bp.address);
                 break;
             case BreakPoint::Type::LOGICAL:
-                std::println("0x{:X} {:04X}:{:04X} logical", i, bp.seg, bp.address);
+                std::println(stderr, "0x{:X} {:04X}:{:04X} logical", i, bp.seg, bp.address);
                 break;
             }
         }
@@ -970,7 +979,7 @@ bool Debugger::handleLine(const std::string& line)
         addPhysicalBreakPoint(*phys);
     } else if (cmd == "cr") {
         for (size_t i = 0; i < std::size(cpu_.cregs_); ++i)
-            std::println("CR{} {:08X}", i, cpu_.cregs_[i]);
+            std::println(stderr, "CR{} {:08X}", i, cpu_.cregs_[i]);
     } else if (cmd == "d" || cmd == "dp" || cmd == "d16" || cmd == "d32" || cmd == "dp16" || cmd == "dp32") {
         const bool isPhys = cmd.length() > 1 && cmd[1] == 'p';
         auto cpuInfo = cpu_.cpuInfo();
@@ -992,10 +1001,10 @@ bool Debugger::handleLine(const std::string& line)
             offset = 0;
             try {
                 auto res = Decode(cpuInfo, ifetch);
-                std::print("{}\n", FormatDecodedInstructionFull(res, addr));
+                std::print(stderr, "{}\n", FormatDecodedInstructionFull(res, addr));
                 addr += res.numInstructionBytes;
             } catch (const std::exception& e) {
-                std::print("{} - {}\n", addr, e.what());
+                std::print(stderr, "{} - {}\n", addr, e.what());
                 break;
             }
         }
@@ -1024,21 +1033,27 @@ bool Debugger::handleLine(const std::string& line)
             start = static_cast<uint32_t>(*ofs & ~7);
             end = std::min(limit, start + 7);
         } else {
-            std::println("{}DT base={:08X} limit={:04X}", local ? "L" : "G", base, limit);
+            std::println(stderr, "{}DT base={:08X} limit={:04X}", local ? "L" : "G", base, limit);
         }
         for (uint32_t offset = start; offset + 7 <= end; offset += 8) {
             const auto descValue = peekMemLinear(base + offset, 8);
             const auto desc = SegmentDescriptor::fromU64(descValue);
             if ((desc.access & SD_ACCESS_MASK_TYPE) || ofs)
-                std::println("{:02X} {:016X} {}", offset, descValue, desc);
+                std::println(stderr, "{:02X} {:016X} {}", offset, descValue, desc);
         }
     } else if (cmd == "h") {
-        cpu_.showHistory();
+        size_t count = 10;
+        if (auto n = parser.getNumber(); n)
+            count = *n;
+        cpu_.showHistory(stderr, count);
     } else if (cmd == "hc") {
-        cpu_.showControlTransferHistory();
+        size_t count = 10;
+        if (auto n = parser.getNumber(); n)
+            count = *n;
+        cpu_.showControlTransferHistory(stderr, count);
     } else if (cmd == "idt") {
         const auto& idt = cpu_.idt_;
-        std::println("IDT base={:08X} limit={:04X}", idt.base, idt.limit);
+        std::println(stderr, "IDT base={:08X} limit={:04X}", idt.base, idt.limit);
         for (uint32_t idtOffset = 0; idtOffset + 7 <= idt.limit; idtOffset += 8) {
             const auto desc = peekMemLinear(idt.base + idtOffset, 8);
             if (desc) {
@@ -1047,7 +1062,7 @@ bool Debugger::handleLine(const std::string& line)
                 const auto flags = (desc >> 40) & 0xff;
                 const auto type = flags & 0xf;
                 const auto dpl = (flags >> 5) & 3;
-                std::println("Int{:02X} {:016X} {:X}:{:08X} DPL={} Type={:02X}", idtOffset / 8, desc, selector, offset, dpl, type);
+                std::println(stderr, "Int{:02X} {:016X} {:X}:{:08X} DPL={} Type={:02X}", idtOffset / 8, desc, selector, offset, dpl, type);
             }
         }
     } else if (cmd == "m" || cmd == "mp") {
@@ -1065,7 +1080,7 @@ bool Debugger::handleLine(const std::string& line)
         DebuggerMemState ms;
         initMemState(ms, SREG_CS, 0);
         if (getAddress(ms))
-            std::println("{} - {:08X}", ms, toPhys(ms, 0));
+            std::println(stderr, "{} - {:08X}", ms, toPhys(ms, 0));
     } else if (cmd == "r") {
         if (auto regName = parser.getWord(); !regName.empty()) {
             if (auto regInfo = RegLookup(cpu_, regName); regInfo.first) {
@@ -1076,13 +1091,13 @@ bool Debugger::handleLine(const std::string& line)
                 RegSet(regInfo, *value);
                 // For safety's sake clear the prefetch buffer
                 // TODO: Handle changing of sregs in protected mode
-                std::println("Clearing prefetch buffer");
+                std::println(stderr, "Clearing prefetch buffer");
                 cpu_.prefetch_.flush(cpu_.ip_ & cpu_.ipMask());
             } else {
                 throw std::runtime_error { std::format("Invalid register {}", regName) };
             }
         }
-        ShowCPUState(cpu_);
+        ShowCPUState(stderr, cpu_);
     } else if (cmd == "search") {
         auto bytes = HexDecode(parser.getWord());
         if (bytes.empty())
@@ -1097,11 +1112,11 @@ bool Debugger::handleLine(const std::string& line)
             for (uint64_t j = 1; j < bytes.size() && found; ++j)
                 found &= bus_.peekU8(pos + j) == bytes[j];
             if (found)
-                std::println("Found at {:X}", pos);
+                std::println(stderr, "Found at {:X}", pos);
         }
     } else if (cmd == "sr") {
         for (int i = 0; i < 6; ++i) {
-            std::println("{} {:04X} {}", SRegText[i], cpu_.sregs_[i], cpu_.sdesc_[i]);
+            std::println(stderr, "{} {:04X} {}", SRegText[i], cpu_.sregs_[i], cpu_.sdesc_[i]);
         }
     } else if (cmd == "t") {
         traceCount_ = 1;
@@ -1118,7 +1133,7 @@ bool Debugger::handleLine(const std::string& line)
 
         auto finish = [&]() {
             if (virtLen) {
-                std::println("{:08X}-{:08X} 0x{:X} KB", virtStart, virtStart + virtLen - 1, virtLen/1024);
+                std::println(stderr, "{:08X}-{:08X} 0x{:X} KB", virtStart, virtStart + virtLen - 1, virtLen/1024);
             }
             virtLen = 0;
         };
@@ -1148,7 +1163,7 @@ bool Debugger::handleLine(const std::string& line)
         auto phys = getPhysicalIp(cpu_);
         auto res = Decode(cpu_.cpuInfo(), [&]() { return bus_.peekU8(phys++); });
         if (cpu_.protectedMode() && cpu_.cpl() == 0 && res.instructionBytes[0] == 0xCD && res.instructionBytes[1] == 0x20) {
-            std::println("Skipping over VxdCall!");
+            std::println(stderr, "Skipping over VxdCall!");
             phys += 4;
         }
         autoBreakPoint_.type = BreakPoint::Type::PHYSICAL;
@@ -1206,21 +1221,21 @@ bool Debugger::handleLine(const std::string& line)
 
             if (item % itemsPerLine == 0) {
                 if (isPhys)
-                    std::print("{:08x} ", ms.address.offset() + offset);
+                    std::print(stderr, "{:08x} ", ms.address.offset() + offset);
                 else
-                    std::print("{} ", ms.address + offset);
+                    std::print(stderr, "{} ", ms.address + offset);
             }
 
             for (size_t i = 0; i < fmt.size; ++i, ++offset)
                 buffer[fmt.size - 1 - i] = bus_.peekU8(isPhys ? ms.address.offset() + offset : toPhys(ms, offset));
-            std::print("{}", HexString(buffer, fmt.size));
+            std::print(stderr, "{}", HexString(buffer, fmt.size));
             if ((item + 1) % itemsPerLine == 0)
-                std::println("");
+                std::println(stderr, "");
             else
-                std::print(" ");
+                std::print(stderr, " ");
         }
         if (count % itemsPerLine)
-            std::println("");
+            std::println(stderr, "");
     } else if (auto it = functions_.find(std::string(cmd)); it != functions_.end()) {
         struct DebugIf : public DebuggerInterface {
             explicit DebugIf(DebuggerLineParser& lp)
@@ -1251,7 +1266,7 @@ bool Debugger::handleLine(const std::string& line)
         } debuggerInterface { parser };
         it->second(debuggerInterface, cmd);
     } else {
-        std::print("Unknown command \"{}\"\n", cmd);
+        std::print(stderr, "Unknown command \"{}\"\n", cmd);
     }
 
     return true;
@@ -1362,7 +1377,7 @@ void TestDebugger()
             if (*n != number)
                 throw std::runtime_error { std::format("Got {} 0x{:X} expected {} 0x{:X}", *n, *n, number, number) };                
         } catch (const std::exception& e) {
-            std::cout << "Test failed for " << text << ": " << e.what() << "\n";
+            std::println(stderr, "Test failed for {}: {}", text, e.what());
             exit(1);
         }
     }
@@ -1377,7 +1392,7 @@ void TestDebugger()
             if (*addr != expected)
                 throw std::runtime_error { std::format("Got {} expected {}", *addr, expected) };
         } catch (const std::exception& e) {
-            std::cout << "Test failed for " << text << ": " << e.what() << "\n";
+            std::println(stderr, "Test failed for {}: {}", text, e.what());
             exit(1);
         }
     }

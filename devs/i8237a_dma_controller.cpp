@@ -55,12 +55,11 @@ public:
         , wordMode_ { wordMode }
         , channelCountOffset_ { static_cast<uint8_t>(wordMode ? 4 : 0) }
     {
-        assert(pageIoBase == 0x81 || pageIoBase == 0x89);
-        assert(wordMode_ == (pageIoBase == 0x89));
+        assert(pageIoBase == 0x80 || pageIoBase == 0x88);
+        assert(wordMode_ == (pageIoBase == 0x88));
         bus.addCycleObserver(*this);
         bus.addIOHandler(ioBase, wordMode_ ? 32 : 16, *this, true);
-        bus.addIOHandler(pageIoBase, 3, *this, true);
-        bus.addIOHandler(pageIoBase|7, 1, *this, true);
+        bus.addIOHandler(pageIoBase, 8, *this, true);
         reset();
     }
 
@@ -70,6 +69,7 @@ public:
         mask_ = 0xf;
         enabled_ = true;
         std::memset(channels_, 0, sizeof(channels_));
+        std::memset(pageReg_, 0, sizeof(pageReg_));
     }
 
     void runCycles([[maybe_unused]] std::uint64_t cycles) override
@@ -108,13 +108,30 @@ private:
         uint8_t page;
         uint8_t mode;
     } channels_[4];
+    uint8_t pageReg_[4];
 
-    uint8_t pagePortIndex(uint16_t port)
+    uint8_t& pageReg(uint16_t port)
     {
         assert((port & 0xfff0) == 0x80);
-        return (port & 7) == 7 ? 0 : (port & 3) == 3 ? 1
-            : (port & 3) == 1                        ? 2
-                                                     : 3;
+        switch (port & 7) {
+        case 0:
+            return pageReg_[0];
+        case 1:
+            return channels_[2].page;
+        case 2:
+            return channels_[3].page;
+        case 3:
+            return channels_[1].page;
+        case 4:
+            return pageReg_[1];
+        case 5:
+            return pageReg_[2];
+        case 6:
+            return pageReg_[3];
+        case 7:
+            return channels_[0].page;
+        }
+        throw std::runtime_error { "Not reached" };
     }
 
     std::string desc() const
@@ -146,7 +163,7 @@ std::uint8_t i8237a_DMAController::impl::internalRead8(std::uint16_t regNum)
     case 0x08:
         // Status register
         // Should be: REQ3|REQ2|REQ1|REQ0|TC3|TC2|TC1|TC0 (TC3-0 are cleared on read)
-        std::println("{}TODO read of status register, just returning 1 (TC0)", desc());
+        //std::println("{}TODO read of status register, just returning 1 (TC0)", desc());
         return 1; // Return TC0 for IBM PC XT BIOS
     default:
         throw std::runtime_error { std::format("{}Unsupported read from register {:02X}", desc(), regNum) };
@@ -155,10 +172,8 @@ std::uint8_t i8237a_DMAController::impl::internalRead8(std::uint16_t regNum)
 
 std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
 {
-    if (port >= 0x80 && port <= 0x8F) {
-        const auto idx = pagePortIndex(port);
-        return channels_[idx].page;
-    }
+    if (port >= 0x80 && port <= 0x8F)
+        return pageReg(port);
 
     if (wordMode_) {
         if (!(offset & 1))
@@ -221,9 +236,7 @@ void i8237a_DMAController::impl::internalWrite8(std::uint16_t port, std::uint16_
 void i8237a_DMAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value)
 {
     if (port >= 0x80 && port <= 0x8F) {
-        const auto idx = pagePortIndex(port);
-        std::println("{}Channel {} setting page register to {:02x}",   desc(), idx, value);
-        channels_[idx].page = value;
+        pageReg(port) = value;
         return;
     }
 

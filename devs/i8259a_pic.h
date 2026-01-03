@@ -38,14 +38,25 @@ private:
 };
 
 enum : uint8_t {
-    PIC_IRQ_PIT,
-    PIC_IRQ_KEYBOARD,
-    PIC_IRQ_CASCADE,
-    PIC_IRQ_COM2,
-    PIC_IRQ_COM1,
-    PIC_IRQ_LPT2,
-    PIC_IRQ_FLOPPY,
-    PIC_IRQ_LPT1,
+    // PIC1
+    PIC_IRQ_PIT, // 0
+    PIC_IRQ_KEYBOARD, // 1
+    PIC_IRQ_CASCADE, // 2
+    PIC_IRQ_COM2, // 3
+    PIC_IRQ_COM1, // 4
+    PIC_IRQ_LPT2, // 5
+    PIC_IRQ_FLOPPY, // 6
+    PIC_IRQ_LPT1, // 7
+    // PIC2
+    PIC_IRQ_RTC, // 8
+    PIC_IRQ_CGA_VRETRACE, // 9
+    PIC_IRQ_RESERVED_10, // 10
+    PIC_IRQ_RESERVED_11, // 11
+    PIC_IRQ_MOUSE, // 12
+    PIC_IRQ_FPU, // 13
+    PIC_IRQ_HARDDISK, // 14
+    PIC_IRQ_RESERVED_15, // 15
+
 };
 
 #endif

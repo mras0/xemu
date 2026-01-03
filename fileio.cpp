@@ -3,19 +3,18 @@
 #include <cstdio>
 #include <memory>
 
-struct FileCloser {
-    void operator()(std::FILE* fp)
-    {
-        std::fclose(fp);
-    }
-};
-using FilePointer = std::unique_ptr<std::FILE, FileCloser>;
+FilePointer OpenFile(std::string_view filename, const char* mode)
+{
+    auto fn = std::string(filename);
+    FilePointer fp { std::fopen(fn.c_str(), mode) };
+    if (!fp)
+        throw std::runtime_error { "Could not open " + fn + " with mode \"" + mode + "\"" };
+    return fp;
+}
 
 std::vector<std::uint8_t> ReadFile(const std::string& filename)
 {
-    FilePointer fp { std::fopen(filename.c_str(), "rb") };
-    if (!fp)
-        throw std::runtime_error{"Could not open " + filename};
+    FilePointer fp = OpenFile(filename, "rb");
 
     std::fseek(fp.get(), 0, SEEK_END);
     const auto size = static_cast<size_t>(std::ftell(fp.get()));

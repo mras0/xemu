@@ -76,9 +76,9 @@ int main()
         } catch (const std::exception& e) {
             const char* const sep = "---------------------------------------------------";
             std::println("{}", sep);
-            cpu.showHistory();
+            cpu.showHistory(stdout, 100);
             std::println("");
-            cpu.trace();
+            cpu.trace(stdout);
             std::println("");
             std::println("Halted after {} instructions", cpu.instructionsExecuted());
             std::println("{}", e.what());

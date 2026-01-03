@@ -7,7 +7,7 @@
 
 class VGA {
 public:
-    explicit VGA(SystemBus& bus);
+    explicit VGA(SystemBus& bus, bool egaOnly);
     ~VGA();
 
     using DrawFunction = std::function<void(const uint32_t* pixels, int w, int h)>;

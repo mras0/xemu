@@ -85,6 +85,7 @@ PAGE_SIZE       EQU 4096
 PT_MASK_P       EQU 1<<0        ; Present
 PT_MASK_W       EQU 1<<1        ; Writable
 PT_MASK_U       EQU 1<<2        ; User
+PF_MASK_I       EQU 1<<4        ; Page fault due to instruction fetch
 
 PAGING_BASE     EQU 0x10000
 
@@ -104,6 +105,7 @@ ALLOC_PAGES TEST_PAGE2
 TEST_PAGE0_VIRT EQU 0x80000000+0*PAGE_SIZE
 TEST_PAGE1_VIRT EQU 0x80000000+1*PAGE_SIZE
 TEST_PAGE2_VIRT EQU 0x80000000+2*PAGE_SIZE
+TEST_PAGE_NP_VIRT EQU TEST_PAGE2_VIRT+PAGE_SIZE
 
 EMU_ID_OTHER EQU 0
 EMU_ID_DOSBOX EQU 1
@@ -357,6 +359,8 @@ Entry2:
         mov     ecx,TSS_SIZE/4
         xor     eax,eax
         rep     stosd
+        dec     eax
+        stosd           ; Write a dword of 1's beyond limit
         ; Init IOPB
         mov     word [es:TSS_BASE+TSS_IOPB],TSS_IO_BITMAP_START
 
@@ -550,6 +554,14 @@ PModeFail:
         bits    32
         mov     ebp,[esp]
         sub     ebp,5
+        push    eax
+        mov     ax,cs
+        test    ax,3
+        pop     eax
+        jz      .cpl0
+        SET_HANDLER EXCEPTION_UD,.cpl0
+        db      0x0f,0x0b ; UD2
+.cpl0:
         bits    16
         PMODE_EXIT
         jmp     _Fail
@@ -1977,6 +1989,11 @@ Task16:
         add     sp,4
         CHECK16_EQ sp,STACK2_TOP
 
+        push    word 0xfff7
+        TEST_GP16_16 0xfff4,pop es
+        add     sp,2
+        CHECK16_EQ sp,STACK2_TOP
+
 %macro TEST_GP16_16_RETF 3 ; cs,ip,error code
         mov     di,sp
         push    word %1
@@ -1986,12 +2003,12 @@ Task16:
         CHECK16_EQ di,sp
 %endmacro
 
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX ; Dosbox doesn't like these either
+        je      .skip_gp_1
+
         TEST_GP16_16_RETF 0,0,0 ; CS = 0
         TEST_GP16_16_RETF GDT_SEL_UD16|3,0,GDT_SEL_UD16 ; Not a code segment
         TEST_GP16_16_RETF GDT_SEL_USER16,0,GDT_SEL_USER16 ; RPL < CPL
-
-        cmp     byte [EMU_ID],EMU_ID_DOSBOX ; Dosbox aborts with this command
-        je      .skip_gp_1
         TEST_GP16_16 GDT_SEL_NP,call far [cs:.np_dest] ; #GP is raised because DPL is checked before present
 .skip_gp_1:
 
@@ -2074,7 +2091,7 @@ TestGP32:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 %macro SET_TEST_PAGE 2
-        mov     dword [PD800+%1*4],%2|PT_MASK_W|PT_MASK_P
+        mov     dword [PD800+%1*4],%2|PT_MASK_U|PT_MASK_W|PT_MASK_P
 %endmacro
 
 %macro PG_FLUSH 0
@@ -2104,12 +2121,12 @@ TestPaging:
         rep     stosd
 
         ; Each Page Directory Entry maps 4MB (1024 4K pages)
-        mov     dword [ebx],PD000|PT_MASK_W|PT_MASK_P
-        mov     dword [ebx+(0x80000000/(4096*1024))*4],PD800|PT_MASK_W|PT_MASK_P
+        mov     dword [ebx],PD000|PT_MASK_U|PT_MASK_W|PT_MASK_P
+        mov     dword [ebx+(0x80000000/(4096*1024))*4],PD800|PT_MASK_U|PT_MASK_W|PT_MASK_P
 
         ; Identity map first 1MB
         mov     edi,PD000
-        mov     eax,PT_MASK_W|PT_MASK_P
+        mov     eax,PT_MASK_U|PT_MASK_W|PT_MASK_P
         mov     ecx,(1024*1024)/PAGE_SIZE
 .map0:
         stosd
@@ -2226,7 +2243,6 @@ TestPaging1:
         mov     dword [TEST_PAGE1+PAGE_SIZE-4],0x55667788
         CHECK_EQ dword [TEST_PAGE0_VIRT+PAGE_SIZE-2],0x33445566
 
-
         ; movsd across page boundary
         mov     dword [TEST_PAGE0],0x11223344
         mov     dword [TEST_PAGE1+PAGE_SIZE-4],0x55667788
@@ -2259,6 +2275,8 @@ TestPaging1:
         mov     edx,%2
 %%inst:
         %3
+        push    GDT_SEL_DATA32
+        pop     ds
         call    PModeFail
 %%after:
 %endmacro
@@ -2287,8 +2305,49 @@ TestPaging1:
 
 .dbskip1:
         ; Now a read
-        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,0,mov eax,dword [TEST_PAGE2_VIRT+PAGE_SIZE-3]
+        CHECK_PF TEST_PAGE_NP_VIRT,0,mov eax,dword [TEST_PAGE_NP_VIRT-3]
 
+        ;
+        ; Switch to DPL=3
+        ;
+        mov     [TSS_BASE+TSS_ESP0],esp
+        push    dword GDT_SEL_UD32|3
+        push    STACK2_TOP
+        push    dword 0
+        push    dword GDT_SEL_USER32|3
+        GET_LINEAR_BASE eax
+        add     eax,.cpl3
+        push    eax
+        iret
+.cpl3:
+        mov     ax,cs
+        CHECK_EQ ax,GDT_SEL_USER32|3
+        mov     ax,ss
+        CHECK_EQ ax,GDT_SEL_UD32|3
+        mov     ax,ds
+        CHECK_EQ ax,0
+        mov     ax,es
+        CHECK_EQ ax,0
+        mov     ax,fs
+        CHECK_EQ ax,0
+        mov     ax,gs
+        CHECK_EQ ax,0
+        mov     ax,ss
+        mov     ds,ax
+
+        ; Push with target page missing
+        mov     edi,esp
+        mov     esp,TEST_PAGE_NP_VIRT+100
+        CHECK_PF TEST_PAGE_NP_VIRT+100-4,PT_MASK_U|PT_MASK_W,push eax
+        mov     eax,esp
+        mov     esp,edi
+        CHECK_EQ eax,TEST_PAGE_NP_VIRT+100
+
+        SET_HANDLER EXCEPTION_PF,.cpl0
+        mov     al,byte [ds:TEST_PAGE_NP_VIRT]
+        call    PModeFail
+.cpl0:
+        add     esp,6*4
         RESTORE_HANDLER EXCEPTION_PF
 
         ret

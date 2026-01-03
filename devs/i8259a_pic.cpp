@@ -80,13 +80,14 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
                 // OCW2
                 if (value == 0x20) { // non-specific EOI
                     // The highest request level is reset from the IRR when an interrupt is acknowledged.
-                    for (int i = 8; i--;) {
+                    for (int i = 0; i < 8; ++i) {
                         if (isr_ & (1 << i)) {
                             isr_ &= ~(1 << i);
                             return;
                         }
                     }
                     std::println("{}: TODO: non-specific EOI with ISR {:02X}", name, isr_);
+                    //THROW_ONCE();
                     return;
                 }
                 const auto level = value & 7;
@@ -157,10 +158,15 @@ int i8259a_PIC::getInterrupt()
 
     for (int i = 0; i < 8; ++i) {
         const uint8_t mask = 1 << i;
+        // A higher priority interrupt is being serviced
+        if (isr_ & mask)
+            return -1;
         if (pending & mask) {
             irr_ &= ~mask;
             isr_ |= mask;
             //std::println("PIC: IRQ {}", i);
+            if (companion_ && !isSlave_ && (icw3_ & mask))
+                return companion_->getInterrupt();
             return i | icw2_;
         }
     }
@@ -169,8 +175,8 @@ int i8259a_PIC::getInterrupt()
 
 void i8259a_PIC::setInterrupt(std::uint8_t line)
 {
+    line &= 7;
     const uint8_t mask = static_cast<uint8_t>(1 << line);
-    assert(line < 8);
     irr_ |= mask;
 
     if (icw1_ & ICW1_MASK_SINGLE)
@@ -180,15 +186,12 @@ void i8259a_PIC::setInterrupt(std::uint8_t line)
     if (isSlave_) {
         companion_->setInterrupt(icw3_);
         return;
-    }
-    
-    if (companion_ && (icw3_ & mask))
-        throw std::runtime_error { "TODO: Handle interrupt on master slave PIC line " + std::to_string(line) };
+    }   
 }
 
 void i8259a_PIC::clearInterrupt(std::uint8_t line)
 {
-    assert(line < 8);
+    line &= 7;
     irr_ &= ~(1 << line);
 }
 

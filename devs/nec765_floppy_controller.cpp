@@ -334,10 +334,28 @@ void NEC765_FloppyController::impl::outU8(uint16_t port, uint16_t offset, std::u
         } else if (state_ == State::CommandArgsPhase) {
             assert(argsCnt_);
             commandArgs_.push_back(value);
-            if (commandArgs_.size() == argsCnt_)
-                executeCommand();
         } else {
             throw std::runtime_error { std::format("Floppy: Unsupported with to {:04X} value {:02X} -- state = {}", port, value, (int)state_) };
+        }
+        if (commandArgs_.size() == argsCnt_) {
+            try {
+                executeCommand();
+            } catch (const std::exception& e) {
+                std::println("Floppy: {}", e.what());
+
+                state_ = State::ResultPhase;
+                result_.clear();
+                setSt0(1<<6);
+                result_.push_back(st0_);
+                result_.push_back(1 << 2); // ST1 (Bit 2 = No Data)
+                result_.push_back(0); // ST2
+                result_.push_back(0); // dr.cylinder
+                result_.push_back(0); // dr.head
+                result_.push_back(0); // dr.sector
+                result_.push_back(2); // N (sector size 512)
+                raiseIRQ();
+
+            }
         }
         break;
     case NEC765_REG_RESERVED:
@@ -371,11 +389,7 @@ void NEC765_FloppyController::impl::getCommandArgs()
     default:
         argsCnt_ = 0;
     }
-    if (argsCnt_) {
-        state_ = State::CommandArgsPhase;
-    } else {
-        executeCommand();
-    }
+    state_ = State::CommandArgsPhase;
 }
 
  void NEC765_FloppyController::impl::setSt0(uint8_t info)

@@ -157,7 +157,7 @@ struct CPUState {
 };
 
 std::string FormatCPUFlags(uint32_t flags);
-void ShowCPUState(const CPUState& state);
+void ShowCPUState(std::FILE* fp, const CPUState& state);
 
 struct SegmentedAddress {
     SReg sreg;
@@ -180,13 +180,19 @@ public:
     }
 };
 
+struct CPUExecutionHistoryEntry {
+    CPUState state;
+    uint8_t instructionBytes[MaxInstructionBytes];
+    int exception;
+};
+
 class CPU : public CPUState {
 public:
     using InterruptFunc = std::function<int ()>;
 
     explicit CPU(CPUModel cpuModel, SystemBus& bus);
 
-    static constexpr size_t MaxHistory = 256;
+    static constexpr size_t MaxHistory = 1024;
 
     void reset();
     void setInterruptFunction(InterruptFunc func)
@@ -202,9 +208,10 @@ public:
     {
         return halted_;
     }
-    void trace();
-    void showHistory(size_t max = MaxHistory);
-    void showControlTransferHistory(size_t max = maxControlTransferHistory);
+    void trace(std::FILE* fp);
+    void showHistory(std::FILE* fp, size_t max = MaxHistory);
+    void showControlTransferHistory(std::FILE* fp, size_t max = maxControlTransferHistory);
+    const CPUExecutionHistoryEntry* getHistory(size_t back) const;
     void step();
     Address currentIp() const;
     int lastExceptionNo() const;
@@ -230,11 +237,7 @@ private:
     SystemBus& bus_;
     InterruptFunc intFunc_;
     InstructionDecodeResult currentInstruction;
-    struct {
-        CPUState state;
-        uint8_t instructionBytes[MaxInstructionBytes];
-        int exception;
-    } history_[MaxHistory];
+    CPUExecutionHistoryEntry history_[MaxHistory];
     size_t instructionsExecuted_;
     uint64_t currentIp_;
     bool halted_;
@@ -255,7 +258,7 @@ private:
 
     SegmentedAddress currentSp() const;
 
-    void showState(const CPUState& state, const uint8_t* instructionBytes);
+    void showState(std::FILE* fp, const CPUState& state, const uint8_t* instructionBytes);
 
     void updateFlags(std::uint64_t value, std::uint64_t carry, std::uint32_t flagsMask);
     void setFlags(std::uint32_t value);
@@ -294,8 +297,8 @@ private:
     // Stack helpers
     void push(std::uint64_t value, std::uint8_t size = 0); // 0 = default operand size
     std::uint64_t pop(std::uint8_t size = 0); // 0 = default operand size
-    std::uint64_t readStack(std::int32_t itemOffset);
-    void writeStack(std::int32_t itemOffset, std::uint64_t value);
+    std::uint64_t readStack(std::int32_t itemOffset, std::uint8_t size = 0); // 0 = default operand size
+    void writeStack(std::int32_t itemOffset, std::uint64_t value, std::uint8_t size = 0); // 0 = default operand size
     void updateSp(std::int32_t itemCount);
 
     enum class ControlTransferType { jump, call, int32, int16, iret, retf, max };

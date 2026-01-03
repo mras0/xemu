@@ -151,9 +151,12 @@ void TestDecode32(CPUModel model)
         { "66621D00000200", "BOUND\tBX, [0x00020000]" },
         { "66C8010000", "ENTER\t0x0001, 0x00" },
         { "0F00CB", "STR\tEBX" },
-        { "36FF8074440580", "INC\tDWORD [SS:EAX-0x7FFABB8C]" },
         { "8322FE", "AND\tDWORD [EDX], 0xFFFFFFFE" },
-        { "FF96080E0180", "CALL\tDWORD [ESI-0x7FFEF1F8]" },
+        // Fine, but annoying to look at
+        //{ "36FF8074440580", "INC\tDWORD [SS:EAX-0x7FFABB8C]" },
+        //{ "FF96080E0180", "CALL\tDWORD [ESI-0x7FFEF1F8]" },
+        { "36FF8074440580", "INC\tDWORD [SS:EAX+0x80054474]" },
+        { "FF96080E0180", "CALL\tDWORD [ESI+0x80010E08]" },
     };
 
     RunTests(cpuInfo, t386);

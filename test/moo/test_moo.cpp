@@ -1090,8 +1090,8 @@ static void TestMooFile(MooTestMachine& machine, const std::string& filename, ui
             machine.runTest(test, ignoredFlagsMask);
         } catch ([[maybe_unused]] const std::exception& e) {
             PrintTestInfo(test);
-            machine.cpu().showHistory();
-            ShowCPUState(machine.cpu());
+            machine.cpu().showHistory(stdout, 100);
+            ShowCPUState(stdout, machine.cpu());
             std::println("{:04X}:{:04X}", machine.cpu().sregs_[SREG_CS], machine.cpu().ip_);
             std::println("");
             if (test.flagsStackAddr)
@@ -1116,7 +1116,8 @@ static void RunTestsInDir(CPUModel model, const std::string& path, const std::se
     [[maybe_unused]] std::set<std::string> passingIgnoredTests, failedButNotIgnored;
     [[maybe_unused]] std::map<std::string, MooMeta> testMeta;
 
-    MooTestMachine machine { model };
+    auto machine_ = std::make_unique<MooTestMachine>(model);
+    MooTestMachine& machine = *machine_;
     int skipped = 0, passed = 0;
 
     ForAllMooFiles(path, [&](const auto& testName, const auto& filename) {

@@ -78,8 +78,6 @@ T SystemBus::read(std::uint64_t addr)
         }
     }
     std::println("Read of size {} from unmmaped address {:X}", sizeof(T), addr);
-    if (addr == 0xC9FF8)
-        throw std::runtime_error { "XXX" };
     if constexpr (sizeof(T) == 1)
         return 0xF4; // HLT opcode
     else
@@ -93,10 +91,11 @@ void SystemBus::write(std::uint64_t addr, T value)
     addr &= addressMask_;
 
     #if 0
-    const auto watchAddr = 0x0038FFFD;
+    const auto watchAddr = 0x00489E94 + 1;
     if (addr <= watchAddr && addr + sizeof(T) - 1 >= watchAddr) {
-        std::println(">>>>>>>>> Write of size {} to address {:X} value={:0{}X}", sizeof(T), addr, value, sizeof(T) * 2);
-        THROW_ONCE();
+        extern std::string CPUIPString();
+        std::println(stderr, ">>>>>>>>> {} Write of size {} to address {:X} value={:0{}X}", CPUIPString(), sizeof(T), addr, value, sizeof(T) * 2);
+        //THROW_FLIPFLOP();
     }
     #endif
 
@@ -128,6 +127,9 @@ void SystemBus::recalcNextAction()
 
 void SystemBus::addCycles(std::uint64_t count)
 {
+    // Originally the system clock was 14.31818 MHz, /3 -> 4.77MHz for the CPU and /4 -> 3.579545 MHz for NTSC
+    count *= 3;
+
     count *= 2; // Fudge factor...
     cycles_ += count;
     if (cycles_ >= nextAction_)
@@ -136,8 +138,7 @@ void SystemBus::addCycles(std::uint64_t count)
 
 void SystemBus::runCycles()
 {
-    // Originally the system clock was 14.31818 MHz, /3 -> 4.77MHz for the CPU and /4 -> 3.579545 MHz for NTSC
-    const auto cycles = std::exchange(cycles_, 0) * 3;
+    const auto cycles = std::exchange(cycles_, 0);
     for (auto& obs : cycleObservers_)
         obs->runCycles(cycles);
     recalcNextAction();

@@ -8,7 +8,7 @@
 
 class GUI {
 public:
-    explicit GUI(int w, int h, int xscale = 1, int yscale = 1);
+    explicit GUI(int w, int h, int guiScale);
     ~GUI();
 
     enum class EventType {
@@ -16,6 +16,8 @@ public:
         keyboard,
         diskInsert,
         diskEject,
+        mouseMove,
+        mouseButton,
     };
 
     struct Event {
@@ -29,6 +31,13 @@ public:
             struct {
                 std::uint8_t drive;
             } diskEject;
+            struct {
+                int dx, dy;
+            } mouseMove;
+            struct {
+                int index;
+                bool down;
+            } mouseButton;
         };
     };
 
@@ -40,6 +49,6 @@ private:
 };
 
 void SetGuiActive(bool active);
-void DrawScreen(const uint32_t* pixels);
+void DrawScreen(const uint32_t* pixels, int w, int h);
 
 #endif

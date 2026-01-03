@@ -56,7 +56,8 @@ std::uint8_t i8253_PIT::inU8(uint16_t port, uint16_t offset)
         channel_[offset].latch >>= 8;
         return static_cast<uint8_t>(val);
     }
-    return IOHandler::inU8(port, offset);
+    std::println("PIT: Warning reading mode control register ({:02X})!", port);
+    return channel_[0].control;
 }
 
 void i8253_PIT::outU8(uint16_t port, uint16_t offset, std::uint8_t value)

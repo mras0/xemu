@@ -65,7 +65,7 @@ private:
     bool checkBreakPoint(const BreakPoint& bp);
         
     bool handleLine(const std::string& line);
-    void initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset);
+    void initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset, uint8_t addressSize = 0);
     uint64_t toPhys(const DebuggerMemState& ms, uint64_t offset);
     uint64_t toPhys(uint64_t linearAddress);
     uint64_t peekMem(uint64_t physAddress, size_t size);

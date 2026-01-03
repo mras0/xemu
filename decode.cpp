@@ -602,7 +602,7 @@ static std::string FormatDecodedEA(const DecodedEAInfo& info, LabelLookupFunc la
 
     auto disp_string = [](int disp, size_t width) {
         std::string s;
-        if (disp < 0) {
+        if (disp < 0 && (static_cast<uint32_t>(disp) >> 30) != 2) { // Don't turn 0x8..... into -0x7...
             s += '-';
             disp = -disp;
         } else {

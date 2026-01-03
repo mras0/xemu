@@ -21,7 +21,7 @@
 #include "bios_replacement.h"
 #include "disk_data.h"
 
-#define USE_EGA
+static constexpr bool egaOnly = false;
 
 class XTPPI : public IOHandler, public CycleObserver {
 public:
@@ -197,6 +197,22 @@ public:
     {
         std::println("Ignoring key scanCode=0x{:02X} down={}", key.scanCode, key.down);
     }
+    
+    virtual void mouseMoveEvent(int dx, int dy)
+    {
+        (void)dx;
+        (void)dy;
+    }
+
+    virtual void mouseButtonEvent(int idx, bool down)
+    {
+        (void)idx;
+        (void)down;
+    }
+
+    virtual void mouseUpdate()
+    {
+    }
 
     virtual void forceRedraw() { }
 };
@@ -254,7 +270,7 @@ public:
                 // std::println("PIT interrupt");
                 pic.setInterrupt(PIC_IRQ_PIT);
             } }
-        , dma { bus, 0x00, 0x81, false }
+        , dma { bus, 0x00, 0x80, false }
         , ppi { bus,
             [this](bool state) {
                 std::println("XT Keyboard interrupt state {}", state);
@@ -392,19 +408,35 @@ public:
     {
         bus.addIOHandler(0x80, 1, *this); // PORT_DIAG
         bus.addIOHandler(0x400, numLevels, *this); // PANIC_PORT, ...
+        // SeaBIOS
+        bus.addIOHandler(0x500, 1, *this);
+        bus.addIOHandler(VBE_DISPI_IOPORT_INDEX, 2, *this);
     }
 
 private:
+    static constexpr std::uint16_t VBE_DISPI_IOPORT_INDEX = 0x01CE;
+    static constexpr std::uint16_t VBE_DISPI_IOPORT_DATA = 0x01CF;
     static constexpr std::uint16_t numLevels = 4;
     static constexpr const char* const desc_[numLevels] = {
         "PANIC", "PANIC2", "INFO", "DEBUG"
     };
     std::string buffers_[numLevels];
+    std::string seaBuffer_;
     std::uint8_t diagLast_ = 0xcd;
     std::uint32_t diagCount_ = 0;
 
     void outU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
     {
+        if (port == 0x500) {
+            if (value == 10) {
+                std::println("SeaBIOS diag: {}", seaBuffer_);
+                seaBuffer_.clear();
+            } else {
+                seaBuffer_.push_back(value);
+            }
+            return;
+        }
+
         if (port == 0x80) {
             if (value != diagLast_) {
                 std::print("BOCHS diag: 0x{:02X}", value);
@@ -427,6 +459,24 @@ private:
         } else {
             buf.push_back(value);
         }
+    }
+
+    std::uint16_t inU16([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        if (port != VBE_DISPI_IOPORT_INDEX && port != VBE_DISPI_IOPORT_DATA)
+            return IOHandler::inU16(port, offset);
+        std::println("Ignoring read from bochs svga port {:04X} ({})", offset, offset == VBE_DISPI_IOPORT_INDEX ? "index" : "data");
+        return 0xffff;
+    }
+
+    void outU16([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint16_t value) override
+    {
+        if (port != VBE_DISPI_IOPORT_INDEX && port != VBE_DISPI_IOPORT_DATA) {
+            IOHandler::outU16(port, offset, value);
+            return;
+        }
+
+        std::println("Ignoring write to bochs svga port {:04X} ({}) {:04X}", offset, offset == VBE_DISPI_IOPORT_INDEX ? "index" : "data", value);
     }
 };
 
@@ -528,9 +578,9 @@ public:
         , extendedMem { 15 * 1024 * 1024 }
         , a20control { bus }
         , cmos { bus }
-        , dma1 { bus, 0x00, 0x81, false }
-        , dma2 { bus, 0xC0, 0x89, true }
-        , video { bus }
+        , dma1 { bus, 0x00, 0x80, false }
+        , dma2 { bus, 0xC0, 0x88, true }
+        , video { bus, egaOnly }
         , pic1 { bus, 0x20 }
         , pic2 { bus, 0xA0 }
         , pit { bus,
@@ -540,9 +590,13 @@ public:
             } }
         , ps2 { bus, 
             [this]() {
-                std::println("Keyboard interrupt");
+                //std::println("Keyboard interrupt");
                 pic1.setInterrupt(PIC_IRQ_KEYBOARD);
                },
+            [this]() {
+                //std::println("Mouse interrupt");
+                pic2.setInterrupt(PIC_IRQ_MOUSE);
+            },
             [this](bool value) {
                 a20control.setKbdA20Line(value);
             }
@@ -572,11 +626,7 @@ public:
     CMOS cmos;
     i8237a_DMAController dma1;
     i8237a_DMAController dma2;
-#ifdef USE_EGA
     VGA video;
-#else
-    CGA video;
-#endif
     i8259a_PIC pic1;
     i8259a_PIC pic2;
     i8253_PIT pit;
@@ -595,6 +645,21 @@ public:
         ps2.enqueueKey(key);
     }
 
+    void mouseMoveEvent(int dx, int dy) override
+    {
+        ps2.mouseMove(dx, dy);
+    }
+
+    void mouseButtonEvent(int idx, bool down) override
+    {
+        ps2.mouseButton(idx, down);
+    }
+
+    void mouseUpdate() override
+    {
+        ps2.mouseUpdate();
+    }
+
     uint8_t inU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
     {
         if (isCommPort(port) || isATAPort(port))
@@ -603,8 +668,10 @@ public:
         if (port == 0x201) // Game port
             return 0xFF;
 
-        if (port == 0x1CF) // SEA bios
+        if (port == 0x34) { // Win3.1 install
+            std::println("Ignoring read from port {:04X}", port);
             return 0xFF;
+        }
 
         if (port == 0xA20 || port == 0xA24) { // ??? Power management? (Win3.1)
             std::println("Ignoring read from port {:04X}", port);
@@ -639,6 +706,10 @@ public:
                     serialData += value;
                 if (value == '\n') {
                     std::println("Serial data: {:?}", serialData);
+
+                    if (serialData.starts_with("ERROR"))
+                        THROW_FLIPFLOP();
+
                     serialData.clear();
                 }
             }
@@ -711,44 +782,44 @@ int main()
         const int guiWidth = 800;
         const int guiHeight = 600;
 
-        GUI gui { guiWidth, guiHeight };
+        GUI gui { guiWidth, guiHeight, 2 };
         SetGuiActive(true);
-        [[maybe_unused]] std::vector<uint32_t> screenBuffer(guiWidth * guiHeight);
-
 
         std::function<void(uint8_t, std::string_view)> diskInsertionEvent = [](uint8_t drive, std::string_view filename) {
             throw std::runtime_error { std::format("No support for disk insertion in drive {:02X} {:?}", drive, filename) };
         };
 
         Clone386Machine machine;
-        machine.video.setDrawFunction([&screenBuffer](const uint32_t* pixels, int w, int h) {
-            if (!pixels) {
-                // No sync
-                for (int y = 0; y < guiHeight; ++y) {
-                    for (int x = 0; x < guiWidth; ++x) {
-                        screenBuffer[x + y * guiWidth] = ((x >> 2) ^ (y >> 2)) & 1 ? 0x555555 : 0x111111;
-                    }
-                }
-                DrawScreen(screenBuffer.data());
+        machine.video.setDrawFunction([&](const uint32_t* pixels, int w, int h) {
+            if (pixels) {
+                DrawScreen(pixels, w, h);
                 return;
             }
-            StretchImage(&screenBuffer[0], guiWidth, guiHeight, pixels, w, h);
-            DrawScreen(screenBuffer.data());
+            // No sync
+            std::vector<uint32_t> screenBuffer(guiWidth * guiHeight);
+            for (int y = 0; y < guiHeight; ++y) {
+                for (int x = 0; x < guiWidth; ++x) {
+                    screenBuffer[x + y * guiWidth] = ((x >> 2) ^ (y >> 2)) & 1 ? 0x555555 : 0x111111;
+                }
+            }
+            DrawScreen(screenBuffer.data(), guiWidth, guiHeight);
+            return;
         });
 
-        const char* diskName = "../misc/asmtest/egagfx/test.img";
+       // const char* diskName = "../misc/asmtest/egagfx/test.img";
+       //const char* diskName = "../misc/asmtest/mousetest/test.img";
+       const char* diskName = "../misc/asmtest/vgatest/test.img";
+       //const char* diskName = R"(c:\prog\xemu\misc\SW\Microsoft Windows 95 OEM (4.00.950) (3.5)\Bootdisk.img)";
+        //const char* diskName = R"(c:\prog\xemu\misc\SW\Microsoft Mouse 9.00 (1993) (3.5-1.44mb)\DISK01.IMG)";
+        //const char* diskName = R"(c:\prog\xemu\misc\EGA\tests\EGA-FLANDA.img)";
        
         try {
             CreateDisk("hd.bin", diskFormatSL520);
             std::println("Created HD");
         } catch (...) {
         }
-#ifdef USE_EGA
-        auto videoRomData = ReadFile(R"(../misc/ega/ega.rom)");
-        //auto videoRomData = ReadFile(R"(c:\Tools\bochs-2.7\bios\VGABIOS-lgpl-latest)");
-#else
-        auto videoRomData = ReadFile(R"(bios/videobios.bin)");
-#endif
+        auto videoRomData = ReadFile(egaOnly ? R"(../misc/ega/ega.rom)" : R"(c:\Tools\bochs-2.7\bios\VGABIOS-lgpl-latest)");
+
         auto videoRom = RomHandler { videoRomData };
         machine.bus.addMemHandler(0xC0000, videoRom.size(), videoRom);
 
@@ -756,6 +827,7 @@ int main()
         BochsDebugHandler bochsDbgHandler { machine.bus };
         PCIHandler pciHandler { machine.bus };
         machine.cmos.set(0x10, 0x44); // 2x1.44MB floppy drives
+        machine.cmos.set(0x14, 0b01110101); // Equipment byte (2 floppy drives / bit2 = pointing device installed)
 
         assert(machine.extendedMem.size() < 16ULL * 1024 * 1024); // TODO: CMOS 0x34/0x35 Extended Mem size in 64K blocks > 16MB
         const auto extMemSize = std::min(size_t(63 * 1024), machine.extendedMem.size() >> 10); // In KB
@@ -763,12 +835,15 @@ int main()
         machine.cmos.set(0x31, static_cast<uint8_t>(extMemSize >> 8)); 
 
 
-        //machine.cmos.set(0x3D, 0x01); // Boot from floppy
         machine.floppy.insertDisk(0, ReadFile(diskName));
-        ////machine.cmos.set(0x3D, 0x21); // Boot from floppy then HD
+        //machine.cmos.set(0x3D, 0x01); // Boot from floppy
         machine.cmos.set(0x3D, 0x02); // Boot from HD
-        machine.ata1.insertDisk(0, "hd.bin");
+        //machine.cmos.set(0x3D, 0x12); // Boot from floppy then floppy
+        //machine.ata1.insertDisk(0, "hd.bin");
         //machine.ata1.insertDisk(0, "win2.bin");
+        //machine.ata1.insertDisk(0, "freedos.bin");
+        //machine.ata1.insertDisk(0, "win95.bin");
+        machine.ata1.insertDisk(0, "win3.1.bin");
         //machine.ata1.insertDisk(0, "freedos.bin");
         
         machine.bus.addMemHandler(0x100000 - rom.size(), rom.size(), rom);
@@ -815,8 +890,13 @@ int main()
         } dbgBreakHandler { machine.bus, dbg };
 
         dbg.setOnActive([&](bool active) {
-            if (active)
-                machine.forceRedraw();
+            if (active) {
+                try {
+                    machine.forceRedraw();
+                } catch (const std::exception& e) {
+                    std::println("{}", e.what());
+                }
+            }
             SetGuiActive(!active);
         });
         machine.video.registerDebugFunction(dbg);
@@ -825,16 +905,18 @@ int main()
         //dbg.addBreakPoint((0xC000 << 4) + 0x448); // POD14_ERR
         //dbg.addBreakPoint((0xC000 << 4) + 0x4E0); // "HOW_BIG"
         //dbg.addBreakPoint((0xC000 << 4) + 0x630);
-        //dbg.addBreakPoint((0xC000 << 4) + 0x660); // PODSTG_ERR0
+        //dbg.addBreakPoint((0xC000 << 4) + 0x660); // PODSTG_ERR02251
         //dbg.addBreakPoint((0xC000 << 4) + 0x5c3);
 
-        //machine.cpu.exceptionTraceMask(0);
+        machine.cpu.exceptionTraceMask(0);
 
         bool quit = false;
+        
         for (unsigned guiUpdateCnt = 0; !quit;) {
 
             if (guiUpdateCnt-- == 0) {
                 guiUpdateCnt = 10000;
+                bool hasMouseEvent = false;
                 for (const auto& evt : gui.update()) {
                     switch (evt.type) {
                     case GUI::EventType::quit:
@@ -849,33 +931,47 @@ int main()
                     case GUI::EventType::diskEject:
                         diskInsertionEvent(evt.diskEject.drive, {});
                         break;
+                    case GUI::EventType::mouseMove:
+                        machine.mouseMoveEvent(evt.mouseMove.dx, evt.mouseMove.dy);
+                        hasMouseEvent = true;
+                        break;
+                    case GUI::EventType::mouseButton:
+                        machine.mouseButtonEvent(evt.mouseButton.index, evt.mouseButton.down);
+                        machine.mouseUpdate();
+                        hasMouseEvent = false;
+                        break;
                     default:
                         throw std::runtime_error { "TODO: Handle event type + " + std::to_string((int)evt.type) };
                     }
                 }
+                if (hasMouseEvent)
+                    machine.mouseUpdate();
             }
+
+            #if 0
+            static bool lastv86 = false;
+            if (auto v86 = cpu.vm86(); v86 != lastv86) {
+                if (v86) {
+                    std::println("*** V86 mode activated with SS:SP {:04X}:{:04X}", cpu.sregs_[SREG_SS], cpu.regs_[REG_SP]);
+                    cpu.trace(stdout);
+                } else {
+                    const auto& s = cpu.getHistory(0)->state;
+                    std::println("*** V86 mode de-activated with SS:SP {:04X}:{:04X}", s.sregs_[SREG_SS], s.regs_[REG_SP]);
+                    cpu.showHistory(stdout, 2);
+                }
+                lastv86 = v86;
+            }
+            #endif
 
             dbg.check();
             try {
-                //if (cpu.ip_ == 0x02CD)
-                //    __nop();
                 cpu.step();
-                //if (cpu.protectedMode() && (cpu.sdesc_[SREG_CS].flags & SD_FLAGS_MASK_DB)) {
-                //    static bool first = true;
-                //    if (first) {
-                //        first = false;
-                //        dbg.activate();
-                //    }
-                //}
             } catch (const std::exception& e) {
                 const char* const sep = "---------------------------------------------------";
-                std::println("{}", sep);
-                //cpu.showHistory();
-                //std::println("");
-                //cpu.trace();
-                std::println("Halted after {} instructions", cpu.instructionsExecuted());
-                std::println("{}", e.what());
-                std::println("{}", sep);
+                std::println(stderr, "{}", sep);
+                std::println(stderr, "Halted after {} instructions", cpu.instructionsExecuted());
+                std::println(stderr, "{}", e.what());
+                std::println(stderr, "{}", sep);
                 dbg.activate();
             }
         }

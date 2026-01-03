@@ -10,10 +10,13 @@ class i8042_PS2Controller {
 public:
     using CallbackType = std::function<void(void)>;
     using A20CallbackType =std::function<void(bool)>;
-    explicit i8042_PS2Controller(SystemBus& bus, CallbackType onDevice1IRQ, A20CallbackType onA20CLinehange);
+    explicit i8042_PS2Controller(SystemBus& bus, CallbackType onDevice1IRQ, CallbackType onDevice2IRQ, A20CallbackType onA20CLinehange);
     ~i8042_PS2Controller();
 
     void enqueueKey(const KeyPress& key);
+    void mouseMove(int dx, int dy);
+    void mouseButton(int idx, bool down);
+    void mouseUpdate();
 
 private:
     class impl;

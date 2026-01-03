@@ -307,26 +307,30 @@ void Disassembler::print()
         if (info.root)
             printLabel(offset);
         const bool vxdCall = isVxDCall(ins, info.opSize);
-        if (vxdCall) {
-            for (int i = 0; i < 4; ++i)
-                ins.instructionBytes[2 + i] = getU8(offset + 2 + i);
-            ins.numInstructionBytes += 4;
-        }
+        //if (vxdCall) {
+        //    for (int i = 0; i < 4; ++i)
+        //        ins.instructionBytes[2 + i] = getU8(offset + 2 + i);
+        //    ins.numInstructionBytes += 4;
+        //}
 
-        std::print(fp_, "{}", FormatDecodedInstructionFull(ins, fakeAddress(offset, opSize), labelLookup));
+        const auto addr = fakeAddress(offset, opSize);
+        std::print(fp_, "{}", FormatDecodedInstructionFull(ins, addr, labelLookup));
+        lastOffset = offset + ins.numInstructionBytes;
         if (vxdCall) {
             const auto vxdId = getU16(offset + 4);
             auto serviceId = getU16(offset + 2);
             std::print(fp_, "\t; VxdCall 0x{:04X},0x{:04X}", vxdId, serviceId);
             serviceId &= 0x7fff;
             if (auto it = vxdNames.find(vxdId); it != vxdNames.end()) {
-                std::print(" {}", it->second);
-                if (vxdId == 1 && serviceId < std::size(VmmServiceIds)) {
-                    std::print(" {}", VmmServiceIds[serviceId]);
+                std::print(fp_, " {}", it->second);
+                if (vxdId == 1 && serviceId < std::size(VmmServiceIds) && serviceId < std::size(VmmServiceDescriptions)) {
+                    std::print(fp_, " {} {}", VmmServiceIds[serviceId], VmmServiceDescriptions[serviceId]);
+
                 }
             }
+            std::print(fp_, "\n{:22} {:02X}{:02X}{:02X}{:02X}         DW\t0x{:04X}, 0x{:04X}", addr, getU8(offset + 2), getU8(offset + 3), getU8(offset + 4), getU8(offset + 5), getU16(offset + 2), getU16(offset + 4));
+            lastOffset += 4;
         }
-        lastOffset = offset + ins.numInstructionBytes;
         std::println(fp_, "");
     }
 }
@@ -381,6 +385,8 @@ struct Symbol {
     std::uint32_t offset;
 };
 
+#define SYM_DEBUG
+
 std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
 {
     if (data.size() < 4)
@@ -389,7 +395,13 @@ std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
 //    const std::string moduleName = std::string(&data[16], &data[16 + data[15]]);
 //    std::println("Module name: {:?}", moduleName);
 
-#if 0
+#ifdef SYM_DEBUG
+#define PR(x) std::println(stderr, "{:20s} {:0{}x}", #x, x, sizeof(x) * 2)
+#else
+#define PR(x)
+#endif
+
+    #if 0
     const uint16_t entrySeg = GetU16(&data[4]); // Segment with program entry point
     const uint16_t numInHeader = GetU16(&data[6]); // Number of names before the first segment (0000:xxxx)
     const uint16_t headSize = GetU16(&data[8]); // Size of header (header + segment zero)
@@ -401,8 +413,8 @@ std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
     PR(headSize);
     PR(numSeg);
     PR(segOne);
-#endif
-#define PR(x) std::println(stderr, "{:20s} {:0{}x}", #x, x, sizeof(x) * 2)
+
+    #endif
 
     uint32_t offset = 0;
     auto get8 = [&]() {
@@ -446,7 +458,9 @@ std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
     PR(symsInSeg0);
     PR(numSegments);
     PR(firstSegAddr);
+#ifdef SYM_DEBUG
     std::println(stderr, "Module name: {:?}", moduleName);
+#endif
     if (symsInSeg0)
         throw std::runtime_error { std::format("TODO: symsInSeg0={}", symsInSeg0) };
     offset = firstSegAddr;
@@ -462,7 +476,9 @@ std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
         const auto segType = get8();
         offset += 5;
         auto segName = getStr();
+#ifdef SYM_DEBUG
         std::println(stderr, "{:?}", segName);
+#endif
         PR(nextAddr);
         PR(numSym);
         PR(symSize);
@@ -705,12 +721,14 @@ int main()
 
         //HexDump(vxdHdr.fpagetab, data.data() + lfanew + vxdHdr.fpagetab, vxdHdr.frectab -  vxdHdr.fpagetab);
 
-        const auto symFile = ReadFile(R"(c:\prog\xemu\misc\SW\Win16DDK\WIN386.SYM)");
+        const auto symFile = ReadFile(R"(c:\prog\xemu\misc\SW\Win16DDK\DDK\386\TOOLS\NODEBUG\WIN386.SYM)");
         //HexDump(0, symFile.data(), 256);
         const auto symbols = ParseSymFile(symFile);
 
-        // N.B. segment 2 is actually loaded to 80283D84
-        Disassembler d { CPUModel::i80386, relocatedCode.data(), relocatedCode.size(), stdout };
+        auto outFile = OpenFile("win386.lst", "wt");
+
+        // N.B. segment 2 is actually loaded to 80283D84 (at first at least)
+        Disassembler d { CPUModel::i80386, relocatedCode.data(), relocatedCode.size(), outFile.get() };
         d.setRelocBase(relocBase);
         for (uint32_t i = 0; i < vxdHdr.objcnt; ++i)
             d.addSegmentStart(objHdr[i].relocationBaseAddress + relocBase);       
@@ -806,17 +824,53 @@ int main()
         for (const auto& [intNo, offset] : intEntries)
             d.addRoot(offset, OPSIZE_PMODE_MASK | 4, std::format("Int{:02X}Entry", intNo).c_str());
 
+        d.addLabel(0x80006C94, "IntEntryMaybeSpecial");
+        d.addLabel(0x80006B9C, "IntEntryGeneric");
         d.addLabel(0x80006CA1, "IntCommonEntry");
+        d.addLabel(0x80006D1B, "Int_NotV86");
+        d.addLabel(0x80006D75, "Int_NotInternal");
+        d.addLabel(0x80006DA2, "Int_GP");
+        d.addLabel(0x800074C9, "FindVxdById");
+        d.addLabel(0x800073CC, "VxDServicePatchInstruction");
+        d.addLabel(0x80007CCA, "NotMagicARPL");
 
-        //for (size_t i = 0; i < 0x100; ++i) // 0x80011108 / 0x80010F88
-        //    std::println("{:02X} {:08X}", i, GetU32(relocatedCode.data() + 0x80010F88 - relocBase + i * 4));
-        //exit(0);
-        d.addRoot(0x8000719F, OPSIZE_PMODE_MASK | 4, "NMIHandler");
-        d.addRoot(0x800071E6, OPSIZE_PMODE_MASK | 4, "MaybeIntHandler01");
-        d.addRoot(0x8000725A, OPSIZE_PMODE_MASK | 4, "GenericIntHandler");
-        d.addRoot(0x80007285, OPSIZE_PMODE_MASK | 4, "DebugIntHandler"); // Int 01h/03h/22h
-        d.addRoot(0x80007393, OPSIZE_PMODE_MASK | 4, "Int20Handler"); // Int 20h
-        d.addRoot(0x8000BFCD, OPSIZE_PMODE_MASK | 4, "UnexpectedInterrupt"); // Only when V86=0
+        // Generic
+        d.addRoot(0x8000719f, OPSIZE_PMODE_MASK | 4, "NMIHandler");
+        d.addRoot(0x8000843c, OPSIZE_PMODE_MASK | 4, "PageFaultHandler"); // #PF
+        d.addRoot(0x8001f2c0, OPSIZE_PMODE_MASK | 4, "IRQHandler_0");
+        d.addRoot(0x8001f2d8, OPSIZE_PMODE_MASK | 4, "IRQHandler_1");
+        d.addRoot(0x8001f2f0, OPSIZE_PMODE_MASK | 4, "IRQHandler_2");
+        d.addRoot(0x8001f308, OPSIZE_PMODE_MASK | 4, "IRQHandler_3");
+        d.addRoot(0x8001f320, OPSIZE_PMODE_MASK | 4, "IRQHandler_4");
+        d.addRoot(0x8001f338, OPSIZE_PMODE_MASK | 4, "IRQHandler_5");
+        d.addRoot(0x8001f350, OPSIZE_PMODE_MASK | 4, "IRQHandler_6");
+        d.addRoot(0x8001f368, OPSIZE_PMODE_MASK | 4, "IRQHandler_7");
+        d.addRoot(0x8001f398, OPSIZE_PMODE_MASK | 4, "IRQHandler_8");
+        d.addRoot(0x8001f3b8, OPSIZE_PMODE_MASK | 4, "IRQHandler_9");
+        d.addRoot(0x8001f3d8, OPSIZE_PMODE_MASK | 4, "IRQHandler_A");
+        d.addRoot(0x8001f3f8, OPSIZE_PMODE_MASK | 4, "IRQHandler_B");
+        d.addRoot(0x8001f418, OPSIZE_PMODE_MASK | 4, "IRQHandler_C");
+        d.addRoot(0x8001f438, OPSIZE_PMODE_MASK | 4, "IRQHandler_D");
+        d.addRoot(0x8001f458, OPSIZE_PMODE_MASK | 4, "IRQHandler_E");
+        d.addRoot(0x8001f478, OPSIZE_PMODE_MASK | 4, "IRQHandler_F");
+
+        // When called from V86
+        d.addRoot(0x800071d5, OPSIZE_PMODE_MASK | 4, "V86_InterruptHandlerExpectedErrors"); // #DE / #DB / #BP / #OF / #BR
+        d.addRoot(0x800071e1, OPSIZE_PMODE_MASK | 4, "V86_UnexpectedIntHandler");
+        d.addRoot(0x80007ca0, OPSIZE_PMODE_MASK | 4, "V86_InvalidOpcodeHandler"); // #UD
+        d.addRoot(0x80036b55, OPSIZE_PMODE_MASK | 4, "V86_NoFPUHandler"); // #NM
+        d.addRoot(0x800085d0, OPSIZE_PMODE_MASK | 4, "V86_GeneralProtectionHandler"); // #GP
+
+        // From (16-bit) protected mode task
+        d.addRoot(0x8000bfcd, OPSIZE_PMODE_MASK | 4, "PM_UnexpectedCPUException");
+        d.addRoot(0x800071e6, OPSIZE_PMODE_MASK | 4, "PM_UnexpectedInt"); // 20h-4Fh
+        d.addRoot(0x80036b44, OPSIZE_PMODE_MASK | 4, "PM_NoFPUHandler"); // #NM
+        d.addRoot(0x800085e8, OPSIZE_PMODE_MASK | 4, "PM_GeneralProtectionHandler"); // #GP
+        
+        // Internal
+        d.addRoot(0x8000725a, OPSIZE_PMODE_MASK | 4, "VMM_UnexpectedInterrupt");
+        d.addRoot(0x80007285, OPSIZE_PMODE_MASK | 4, "VMM_DebugInterrupt"); // Int 1/3/22h
+        d.addRoot(0x80007393, OPSIZE_PMODE_MASK | 4, "VMM_VxdServiceInt"); // Int 20h
 
         #else
         d.addRoot(0x8000F15E, OPSIZE_PMODE_MASK | 4, "@D_Out_Debug_String");

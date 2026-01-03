@@ -4,8 +4,11 @@
 #include <utility>
 #include <cstring>
 
-//#define LOG(...) std::println("ATA: " __VA_ARGS__)
+#if 0
+#define LOG(...) std::println("ATA: " __VA_ARGS__)
+#else
 #define LOG(...)
+#endif
 
 namespace {
 enum {

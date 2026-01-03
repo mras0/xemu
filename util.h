@@ -9,8 +9,10 @@
 #include <cassert>
 #include <utility>
 
-#define THROW_ONCE() do { static bool passed_before_; if (!passed_before_) { passed_before_ = true; throw std::runtime_error{"FORCE BREAK from " + std::string(__func__) + ":" + std::to_string(__LINE__)}; } } while (0)
-#define THROW_FLIPFLOP() do { static bool flipflop_; if (!std::exchange(flipflop_, !flipflop_)) throw std::runtime_error("FORCED FLIPFLOP BREAK from " + std::string(__func__) + ":" + std::to_string(__LINE__)); } while (0);
+#define THROW_MSG(desc) throw std::runtime_error{desc + std::format(" from {} in {}:{}", __func__, __FILE__, __LINE__)}
+
+#define THROW_ONCE() do { static bool passed_before_; if (!passed_before_) { passed_before_ = true; THROW_MSG("FORCED BREAK"); } } while (0)
+#define THROW_FLIPFLOP() do { static bool flipflop_; if (!std::exchange(flipflop_, !flipflop_)) THROW_MSG("FORCED FLIPFLOP BREAK"); } while (0);
 
 std::string FormatXString(std::uint64_t value, size_t width, uint8_t shift);
 
