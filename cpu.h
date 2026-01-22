@@ -10,11 +10,19 @@
 #include "decode.h"
 
 constexpr std::uint32_t CR0_BIT_PE = 0; // Protected Mode Enable
+constexpr std::uint32_t CR0_BIT_MP = 1; // Math Present
+constexpr std::uint32_t CR0_BIT_EM = 2; // (FPU) Emulation
+constexpr std::uint32_t CR0_BIT_TS = 3; // Task switched
+constexpr std::uint32_t CR0_BIT_ET = 4; // ET indicates the type of coprocessor present in the system (80287 or 80387 ) 
 constexpr std::uint32_t CR0_BIT_WP = 16; // Write protect (CPU cannot write to R/O pages in ring 0)
 constexpr std::uint32_t CR0_BIT_PG = 31; // Paging
 
-constexpr std::uint32_t CR0_MASK_PE = 1U << CR0_BIT_PE; // Protected Mode Enable
-constexpr std::uint32_t CR0_MASK_WP = 1U << CR0_BIT_WP; // Write protect
+constexpr std::uint32_t CR0_MASK_PE = 1 << CR0_BIT_PE; // Protected Mode Enable
+constexpr std::uint32_t CR0_MASK_MP = 1 << CR0_BIT_MP; // Math Present
+constexpr std::uint32_t CR0_MASK_EM = 1 << CR0_BIT_EM; // (FPU) Emulation
+constexpr std::uint32_t CR0_MASK_TS = 1 << CR0_BIT_TS; // Task switched
+constexpr std::uint32_t CR0_MASK_ET = 1 << CR0_BIT_ET; // ET indicates the type of coprocessor present in the system (80287 or 80387 )
+constexpr std::uint32_t CR0_MASK_WP = 1 << CR0_BIT_WP; // Write protect (CPU cannot write to R/O pages in ring 0)
 constexpr std::uint32_t CR0_MASK_PG = 1U << CR0_BIT_PG; // Paging
 
 static constexpr std::uint32_t MaxPrefetchQueueLength = 16; // Keep power of two

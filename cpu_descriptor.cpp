@@ -38,7 +38,16 @@ std::format_context::iterator std::formatter<SegmentDescriptor>::format(const Se
                 str += " code";
             else
                 str += " data";
+            if (sd.access & SD_ACCESS_MASK_E) {
+                str += std::format(" C={}", (sd.access & SD_ACCESS_MASK_DC) ? 1 : 0);
+                str += std::format(" R={}", (sd.access & SD_ACCESS_MASK_RW) ? 1 : 0);
+            } else {
+                str += std::format(" D={}", (sd.access & SD_ACCESS_MASK_DC) ? 1 : 0);
+                str += std::format(" W={}", (sd.access & SD_ACCESS_MASK_RW) ? 1 : 0);
+            }
+            str += std::format(" A={}", (sd.access & SD_ACCESS_MASK_A) ? 1 : 0);
         }
+
 FormatDesc:
         str += std::format(" access=0x{:X} flags=0x{:X} base=0x{:X} limit=0x{:X}", sd.access, sd.flags, sd.base, sd.limit);
     } else {
@@ -50,6 +59,7 @@ FormatDesc:
             str += std::format(" {:04X}:{:08X} param count=0x{:X}", sd.call32.selector, sd.call32.offset(), sd.call32.paramCount);
             break;
         default:
+            str += std::format(" access=0x{:X}", sd.access);
             goto FormatDesc;
         }
     }

@@ -275,7 +275,7 @@ private:
     int guiScale_;
     int curW_ = 0;
     int curH_ = 0;
-    std::vector<GUI::Event> events_;
+    std::vector<Event> events_;
     bitmap_window* screen_wnd_;
     static constexpr int maxDisks = 3;
     static constexpr const wchar_t* const diskDescriptors[maxDisks] = {
@@ -296,10 +296,12 @@ private:
     enum {
         MENU_ID_INSERT_DISK = 1,
         MENU_ID_EJECT_DISK = MENU_ID_INSERT_DISK + maxDisks,
-        MENU_ID_GUI_SCALE_1 = MENU_ID_EJECT_DISK + maxDisks,
+        MENU_ID_EXPORT_DISK = MENU_ID_EJECT_DISK + maxDisks,
+        MENU_ID_GUI_SCALE_1 = MENU_ID_EXPORT_DISK + maxDisks,
         MENU_ID_GUI_SCALE_2,
         MENU_ID_GUI_SCALE_4,
         MENU_ID_PASTE,
+        MENU_ID_FOO,
     };
 
     void onCreate()
@@ -311,6 +313,7 @@ private:
             AppendMenu(sysMenu, MF_POPUP, (UINT_PTR)subMenu, diskDescriptors[i]);
             AppendMenu(subMenu, MF_STRING, MENU_ID_INSERT_DISK + i, L"&Insert...");
             AppendMenu(subMenu, MF_STRING, MENU_ID_EJECT_DISK + i, L"&Eject");
+            AppendMenu(subMenu, MF_STRING, MENU_ID_EXPORT_DISK + i, L"E&xport...");
         }
         AppendMenu(sysMenu, MF_MENUBREAK, 0, nullptr);
         AppendMenu(sysMenu, MF_STRING, MENU_ID_GUI_SCALE_1, L"GUI scale &1x1");
@@ -318,6 +321,7 @@ private:
         AppendMenu(sysMenu, MF_STRING, MENU_ID_GUI_SCALE_4, L"GUI scale &4x4");
         AppendMenu(sysMenu, MF_MENUBREAK, 0, nullptr);
         AppendMenu(sysMenu, MF_STRING, MENU_ID_PASTE, L"&Paste");
+        //AppendMenu(sysMenu, MF_STRING, MENU_ID_FOO, L"&Debug stuff");
     }
 
     void keyboard_event(bool down, [[maybe_unused]] int vk, uint32_t info)
@@ -326,15 +330,15 @@ private:
         // See https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/translate.pdf
         const auto scanCode = static_cast<uint8_t>(info >> 16);
 
-        GUI::Event evt {};
-        evt.type = GUI::EventType::keyboard;
+        Event evt {};
+        evt.type = EventType::keyboard;
         evt.key.down = down;
         evt.key.extendedKey = (info & (1 << 24)) != 0;
         evt.key.scanCode = scanCode;
         events_.push_back(evt);
     }
 
-    bool browseForFile(std::string& filename)
+    bool browseForFile(std::string& filename, bool forInsert)
     {
         assert(filename.length() < MAX_PATH);
         OPENFILENAMEA ofn;
@@ -348,7 +352,7 @@ private:
         // ofn.lpstrDefExt = defext;
         ofn.lpstrFile = path;
         ofn.nMaxFile = sizeof(path);
-        ofn.Flags = OFN_PATHMUSTEXIST;
+        ofn.Flags = OFN_HIDEREADONLY | (forInsert ? OFN_PATHMUSTEXIST : OFN_OVERWRITEPROMPT);
         if (!GetOpenFileNameA(&ofn))
             return false;
         filename = path;
@@ -383,24 +387,30 @@ private:
             SWP_NOMOVE | SWP_NOZORDER);
     }
 
+    void diskEvent(bool isInsert, int driveIndex)
+    {
+        auto& filename = diskFileNames_[driveIndex];
+        if (!browseForFile(filename, isInsert))
+            return;
+        Event evt {};
+        evt.type = isInsert ? EventType::diskInsert : EventType::diskExport;
+        evt.diskInsert.drive = driveId[driveIndex];
+        strcpy(evt.diskInsert.filename, filename.c_str()); // FIXME
+        events_.push_back(evt);
+    }
+
     void onSysCommand(int command)
     {
         if (command >= MENU_ID_INSERT_DISK && command < MENU_ID_INSERT_DISK + maxDisks) {
-            const auto driveIndex = command - MENU_ID_INSERT_DISK;
-            auto& filename = diskFileNames_[driveIndex];
-            if (!browseForFile(filename))
-                return;
-            GUI::Event evt {};
-            evt.type = GUI::EventType::diskInsert;
-            evt.diskInsert.drive = driveId[driveIndex];
-            strcpy(evt.diskInsert.filename, filename.c_str()); // FIXME
-            events_.push_back(evt);
+            diskEvent(true, command - MENU_ID_INSERT_DISK);
         } else if (command >= MENU_ID_EJECT_DISK && command < MENU_ID_EJECT_DISK + maxDisks) {
             const auto driveIndex = command - MENU_ID_EJECT_DISK;
-            GUI::Event evt {};
-            evt.type = GUI::EventType::diskEject;
+            Event evt {};
+            evt.type = EventType::diskEject;
             evt.diskEject.drive = driveId[driveIndex];
             events_.push_back(evt);
+        } else if (command >= MENU_ID_EXPORT_DISK && command < MENU_ID_EXPORT_DISK + maxDisks) {
+            diskEvent(false, command - MENU_ID_EXPORT_DISK);
         } else if (command >= MENU_ID_GUI_SCALE_1 && command <= MENU_ID_GUI_SCALE_4) {
             guiScale_ = 1 << (command - MENU_ID_GUI_SCALE_1);
             scaleWindow();
@@ -425,6 +435,12 @@ private:
 
             GlobalUnlock(hData);
             CloseClipboard();
+        } else if (command == MENU_ID_FOO) {
+            Event evt {};
+            evt.type = EventType::mouseMove;
+            evt.mouseMove.dx = 0;
+            evt.mouseMove.dy = -1;
+            events_.push_back(evt);
         }
     }
 
@@ -459,12 +475,11 @@ private:
         GetClientRect(hwnd(), &rcClient);
         if (rcClient.left == rcClient.right || rcClient.top == rcClient.bottom)
             return;
-        GUI::Event evt {};
-
         POINT curPos = { x, y };
         ClientToScreen(hwnd(), &curPos);
 
-        evt.type = GUI::EventType::mouseMove;
+        Event evt {};
+        evt.type = EventType::mouseMove;
         evt.mouseMove.dx = (curPos.x - lastMouse_.x) * curW_ / (rcClient.right - rcClient.left);
         evt.mouseMove.dy = (curPos.y - lastMouse_.y) * curH_ / (rcClient.bottom - rcClient.top);
         if (evt.mouseMove.dx || evt.mouseMove.dy)
@@ -483,8 +498,8 @@ private:
             return;
         }
 
-        GUI::Event evt {};
-        evt.type = GUI::EventType::mouseButton;
+        Event evt {};
+        evt.type = EventType::mouseButton;
         evt.mouseButton.index = index;
         evt.mouseButton.down = down;
         events_.push_back(evt);
@@ -583,8 +598,8 @@ private:
         case wm_get_events:
             if (!pasteBuf_.empty()) {
                 const auto ch = pasteBuf_[0];
-                GUI::Event evt {};
-                evt.type = GUI::EventType::keyboard;
+                Event evt {};
+                evt.type = EventType::keyboard;
                 evt.key.down = !pasteState_;
                 evt.key.extendedKey = false;
                 evt.key.scanCode = (uint8_t)MapVirtualKeyA(LOBYTE(VkKeyScanA(ch)), MAPVK_VK_TO_VSC);
@@ -594,7 +609,7 @@ private:
                 events_.push_back(evt);
             }
 
-            *reinterpret_cast<std::vector<GUI::Event>*>(lParam) = std::move(events_);
+            *reinterpret_cast<std::vector<Event>*>(lParam) = std::move(events_);
             events_.clear();
             break;
         }
@@ -643,7 +658,7 @@ GUI::GUI(int w, int h, int guiScale)
 
 GUI::~GUI() = default;
 
-std::vector<GUI::Event> GUI::update()
+std::vector<Event> GUI::update()
 {
     if (!hMainWindow) {
         Event evt {};

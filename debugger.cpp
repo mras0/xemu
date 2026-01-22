@@ -163,6 +163,10 @@ static RegValueType RegLookup(CPUState& st, std::string_view id)
         return { &st.ip_, 16 };
     else if (upperId == "EIP")
         return { &st.ip_, 32 };
+    else if (upperId == "GDT")
+        return { &st.gdt_.base, 32 };
+    else if (upperId == "LDT")
+        return { &st.ldt_.base, 32 };
 
     return { nullptr, 0 };
 }
@@ -632,9 +636,12 @@ Debugger::Debugger(CPU& cpu, SystemBus& bus)
     : cpu_ { cpu }
     , bus_ { bus }
 {
+    eventCallback_ = [](const Event&) {
+        std::println(stderr, "Ignoring event!");
+    };
+
     InstallBreakHandler();
 }
-
 
 void Debugger::initMemState(DebuggerMemState& ms, SReg sr, uint64_t offset, uint8_t addressSize)
 {
@@ -694,8 +701,12 @@ bool Debugger::checkBreakPoint(const BreakPoint& bp)
     case BreakPoint::Type::INACTIVE:
         return false;
     case BreakPoint::Type::PHYSICAL:
-        if (getPhysicalIp(cpu_) != bp.address)
+        try {
+            if (getPhysicalIp(cpu_) != bp.address)
+                return false;
+        } catch (const std::exception&) {
             return false;
+        }
         break;
     case BreakPoint::Type::LOGICAL:
         if (cpu_.sregs_[SREG_CS] != bp.seg || cpu_.ip_ != bp.address)
@@ -977,6 +988,10 @@ bool Debugger::handleLine(const std::string& line)
         if (!phys)
             throw std::runtime_error { "Physical address missing" };
         addPhysicalBreakPoint(*phys);
+    } else if (cmd == "cls") {
+        #ifdef WIN32
+        system("cls");
+        #endif
     } else if (cmd == "cr") {
         for (size_t i = 0; i < std::size(cpu_.cregs_); ++i)
             std::println(stderr, "CR{} {:08X}", i, cpu_.cregs_[i]);
@@ -1076,6 +1091,21 @@ bool Debugger::handleLine(const std::string& line)
             }
         });
         hexDumpAddr_.address += numLines * 16;
+    } else if (cmd == "mouse") {
+        const auto mouseCmd = parser.getWord();
+        if (mouseCmd != "move")
+            throw std::runtime_error { std::format("Unsupported mouse command {:?}", mouseCmd) };
+        parser.skipSpace();
+        auto dx = parser.getNumber();
+        parser.skipSpace();
+        auto dy = parser.getNumber();
+        if (!dx || !dy)
+            throw std::runtime_error { "Need dx/dy for mouse move" };
+        Event evt {};
+        evt.type = EventType::mouseMove;
+        evt.mouseMove.dx = static_cast<int>(static_cast<int64_t>(*dx));
+        evt.mouseMove.dy = static_cast<int>(static_cast<int64_t>(*dy));
+        eventCallback_(evt);
     } else if (cmd == "phys") {
         DebuggerMemState ms;
         initMemState(ms, SREG_CS, 0);

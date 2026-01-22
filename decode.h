@@ -19,6 +19,8 @@ enum class CPUModel {
     i80586,
 };
 
+const char* CPUModelText(CPUModel model);
+
 struct CPUInfo {
     CPUModel model;
     std::uint8_t defaultOperandSize;

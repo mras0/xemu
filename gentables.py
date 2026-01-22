@@ -299,8 +299,10 @@ def handle_cpu(model):
 
     # INT3 + prefixes
     prefixes = [0x26, 0x2E, 0x36, 0x3E, 0xF2, 0xF3]
+    if cpu_model >= 2:
+        prefixes += [0xF0] # LOCK
     if cpu_model >= 3:
-        prefixes += [0x64, 0x65, 0x66, 0x67, 0xF0 ]
+        prefixes += [0x64, 0x65, 0x66, 0x67]
     skipped = set(prefixes + [0x8C, 0xCC])
 
     add_ins(tab1, 0x8C, "MOV", ["Ew", "Sw"], None)
@@ -339,6 +341,7 @@ def handle_cpu(model):
         tab1[0x8C]["operands"][0] = "MwRv"
         modes.add("MwRv")
 
+    if model >= 2:
         add_ins(tab1, 0x9B, "FWAIT", [], None)
 
     #
@@ -403,6 +406,7 @@ def handle_cpu(model):
     write_cpu_tables()
 
 handle_cpu(0)
+handle_cpu(2)
 handle_cpu(3)
 
 modes = sorted(modes)

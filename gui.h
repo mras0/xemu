@@ -4,42 +4,12 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
-#include "keyboard.h"
+#include "event.h"
 
 class GUI {
 public:
     explicit GUI(int w, int h, int guiScale);
     ~GUI();
-
-    enum class EventType {
-        quit,
-        keyboard,
-        diskInsert,
-        diskEject,
-        mouseMove,
-        mouseButton,
-    };
-
-    struct Event {
-        EventType type;
-        union {
-            KeyPress key;
-            struct {
-                std::uint8_t drive;
-                char filename[256]; // FIXME
-            } diskInsert;
-            struct {
-                std::uint8_t drive;
-            } diskEject;
-            struct {
-                int dx, dy;
-            } mouseMove;
-            struct {
-                int index;
-                bool down;
-            } mouseButton;
-        };
-    };
 
     std::vector<Event> update();
 

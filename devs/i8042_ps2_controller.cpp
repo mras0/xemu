@@ -2,7 +2,8 @@
 #include <print>
 #include <cstring>
 
-#define LOG(...) std::println("i8042: " __VA_ARGS__)
+extern std::string CPUIPString();
+#define LOG(...) std::println("i8042: {} {}", CPUIPString(), std::format(__VA_ARGS__))
 #define ERROR(...) do { LOG(__VA_ARGS__); THROW_FLIPFLOP(); } while (0)
 
 enum : uint8_t {
@@ -74,7 +75,7 @@ static uint8_t popFront(std::vector<uint8_t>& buffer)
 
 class i8042_PS2Controller::impl : public IOHandler {
 public:
-    explicit impl(SystemBus& bus, CallbackType onDevice1IRQ, CallbackType onDevice2IRQ, A20CallbackType onA20CLinehange);
+    explicit impl(SystemBus& bus, CallbackType setDevice1IRQ, CallbackType setDevice2IRQ, A20CallbackType onA20CLinehange);
 
     void reset();
 
@@ -87,8 +88,8 @@ public:
     void mouseUpdate();
 
 private:
-    CallbackType onDevice1IRQ_;
-    CallbackType onDevice2IRQ_;
+    CallbackType setDevice1IRQ_;
+    CallbackType setDevice2IRQ_;
     A20CallbackType onA20CLinehange_;
     uint8_t status_;
     uint8_t portB_;
@@ -148,9 +149,9 @@ private:
     void sendMouseData();
 };
 
-i8042_PS2Controller::impl::impl(SystemBus& bus, CallbackType onDevice1IRQ, CallbackType onDevice2IRQ, A20CallbackType onA20CLinehange)
-    : onDevice1IRQ_ { onDevice1IRQ }
-    , onDevice2IRQ_ { onDevice2IRQ }
+i8042_PS2Controller::impl::impl(SystemBus& bus, CallbackType setDevice1IRQ, CallbackType setDevice2IRQ, A20CallbackType onA20CLinehange)
+    : setDevice1IRQ_ { setDevice1IRQ }
+    , setDevice2IRQ_ { setDevice2IRQ }
     , onA20CLinehange_ { onA20CLinehange }
 {
     bus.addIOHandler(0x60, 5, *this, true);
@@ -192,12 +193,13 @@ void i8042_PS2Controller::impl::checkIrq()
         //    LOG("Device {} enqueued {:02X}", outputDevice_, outputByte_);
     }
 
-    if (((ram_[RAM_LOC_CONFIG] & (CONFIG_MASK_PORT1_IRQ | CONFIG_MASK_PORT1_CLOCK_DISABLE)) == CONFIG_MASK_PORT1_IRQ)
-        && outputDevice_ == 1)
-        onDevice1IRQ_();
-    if (((ram_[RAM_LOC_CONFIG] & (CONFIG_MASK_PORT2_IRQ | CONFIG_MASK_PORT2_CLOCK_DISABLE)) == CONFIG_MASK_PORT2_IRQ)
-        && outputDevice_ == 2)
-        onDevice2IRQ_();
+    const bool irq1 = ((ram_[RAM_LOC_CONFIG] & (CONFIG_MASK_PORT1_IRQ | CONFIG_MASK_PORT1_CLOCK_DISABLE)) == CONFIG_MASK_PORT1_IRQ)
+        && outputDevice_ == 1;
+    const bool irq2 = ((ram_[RAM_LOC_CONFIG] & (CONFIG_MASK_PORT2_IRQ | CONFIG_MASK_PORT2_CLOCK_DISABLE)) == CONFIG_MASK_PORT2_IRQ)
+        && outputDevice_ == 2;
+
+    setDevice1IRQ_(irq1);
+    setDevice2IRQ_(irq2);
 }
 
 void i8042_PS2Controller::impl::setA20State(bool enabled)
@@ -232,7 +234,7 @@ std::uint8_t i8042_PS2Controller::impl::inU8(std::uint16_t port, std::uint16_t o
 
 void i8042_PS2Controller::impl::outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value)
 {
-    //LOG("Port {:02X} value {:02X}, status = {:02X}", port, value, status_);
+    LOG("Port {:02X} value {:02X}, status = {:02X}", port, value, status_);
 
     switch (offset) {
     case 0: // Data
@@ -598,8 +600,8 @@ void i8042_PS2Controller::impl::mouseUpdate()
     sendMouseData();
 }
 
-i8042_PS2Controller::i8042_PS2Controller(SystemBus& bus, CallbackType onDevice1IRQ, CallbackType onDevice2IRQ, A20CallbackType onA20CLinehange)
-    : impl_ { std::make_unique<impl>(bus, onDevice1IRQ, onDevice2IRQ, onA20CLinehange) }
+i8042_PS2Controller::i8042_PS2Controller(SystemBus& bus, CallbackType setDevice1IRQ, CallbackType setDevice2IRQ, A20CallbackType onA20CLinehange)
+    : impl_ { std::make_unique<impl>(bus, setDevice1IRQ, setDevice2IRQ, onA20CLinehange) }
 {
 }
 

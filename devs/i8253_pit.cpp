@@ -64,8 +64,11 @@ void i8253_PIT::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
 {
     if (offset == 3) {
         const auto ch = value >> 6;
-        if (ch == 3)
-            throw std::runtime_error { std::format("PIT: Read-back not supported 0x{:02X}", value) };
+        if (ch == 3) {
+            std::println("PIT: Read-back not supported 0x{:02X}", value);
+            THROW_ONCE();
+            return;
+        }
         if (((value & accessMask) >> accessShift) == 0) {
             channel_[ch].latch = channel_[ch].counter;
             //std::println("PIT: Latching channel {} value=0x{:04X}", ch, channel_[ch].latch);

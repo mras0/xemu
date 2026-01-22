@@ -9,6 +9,8 @@
 #define LOG(...)
 #endif
 
+#define ERROR(...) do { std::println(__VA_ARGS__); THROW_FLIPFLOP(); } while (0)
+
 static constexpr uint8_t ICW1_MASK_ICW4 = 1 << 0;
 static constexpr uint8_t ICW1_MASK_SINGLE = 1 << 1; // Single (no ICW3)/cascade mode
 static constexpr uint8_t ICW1_MASK_INTERVAL4 = 1 << 2; // Call interval 4/8
@@ -35,6 +37,7 @@ void i8259a_PIC::reset()
     isr_ = 0;
     imr_ = 0xff;
     nextReg_ = 0;
+    priority_ = 0;
 }
 
 std::uint8_t i8259a_PIC::inU8(uint16_t port, uint16_t offset)
@@ -54,50 +57,69 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
         // Command
         if (value & ICW1_MASK_INIT) {
             if ((value & ~(ICW1_MASK_INIT | ICW1_MASK_SINGLE)) != ICW1_MASK_ICW4)
-                throw std::runtime_error { std::format("{}: Unsupported ICW1: {:02X}", name, value) };
+                ERROR("{}: Unsupported ICW1: {:02X}", name, value);
             if (!(value & ICW1_MASK_SINGLE) && !companion_)
-                throw std::runtime_error { std::format("{}: Unsupported ICW1: {:02X} - Configured in cascade mode without master/slave", name, value) };
+                ERROR("{}: Unsupported ICW1: {:02X} - Configured in cascade mode without master/slave", name, value);
             icw1_ = value;
+            imr_ = 0;
+            irr_ = 0;
+            isr_ = 0;
             icwCnt_ = 2;
-            std::println("{}: ICW1={:02X}", name, value);
+            priority_ = 0;
+            LOG("{}: ICW1={:02X}", name, value);
         } else {
             // OCW2/3 depending on bit3
             if (value & 8) {
                 // OCW3
                 switch (value & 7) {
-                case 0b010: // read ISR
+                case 0b010: // read IRR
                     nextReg_ = 0;
                     return;
-                case 0b011: // read IRR
+                case 0b011: // read ISR
                     nextReg_ = 1;
                     return;
                 }
-                //if (value == 0x6b || value == 0x4a) {
-                //    std::println("{}: TODO OCW3 {:X} written?!", name, value);
-                //    return;
-                //}
+                ERROR("{}: TODO: OCW3: {:02X} {:08b}", name, value, value);
             } else {
-                // OCW2
-                if (value == 0x20) { // non-specific EOI
+                const uint8_t level = value & 7;
+                const uint8_t command = value >> 5;
+                const char* const commandNames[] = {
+                    "Rotate in auto-EOI (clear)", // b000
+                    "Non-specific EOI", // b001
+                    "No operations", // b010
+                    "Specific EOI", // b011
+                    "Rotate in auto-EOI (set)", // b100
+                    "Rotate on non-specific EOI", // b101
+                    "Set priority", // b110
+                    "Rotate on specific EOI", // b111
+                };
+
+                switch (command) {
+                case 0b001: // Non-specific EOI
                     // The highest request level is reset from the IRR when an interrupt is acknowledged.
                     for (int i = 0; i < 8; ++i) {
-                        if (isr_ & (1 << i)) {
-                            isr_ &= ~(1 << i);
+                        const uint8_t mask =  1 << ((priority_ + i) % 8);
+                        if (isr_ & mask) {
+                            //std::println("EOI FOR {} ISR={:02X} PENDING={:02X}", (priority_ + i) % 8, isr_, pendingMask());
+                            isr_ &= ~mask;
                             return;
                         }
                     }
-                    std::println("{}: TODO: non-specific EOI with ISR {:02X}", name, isr_);
-                    //THROW_ONCE();
+                    // E.g. DOOM2 handles timer interrupts before letting BIOS ack
+                    // std::println("{}: TODO: non-specific EOI with ISR {:02X}", name, isr_);
                     return;
-                }
-                const auto level = value & 7;
-                if ((value & 0xf0) == 0x60) {
+                case 0b011:
                     LOG("{}: OCW2 Specific EOI {:02X} to ISR {:02X}, level = {} -> {:02X}", name, value, isr_, level, isr_ & ~(1 << level));
                     isr_ &= ~(1 << level);
                     return;
+                case 0b110:
+                    LOG("{}: OCW2 Set priority {}", name, level);
+                    priority_ = (level + 1) % 8; // [...] ie if IR5 is programmed as the bottom prior ity device then IR6 will have the highest one
+                    break;
+                default:
+                    ERROR("{}: TODO: OCW2 {:02X} {:08b} {} level {}", name, value, value, commandNames[command], level);
                 }
             }
-            throw std::runtime_error { std::format("{}: Unsupported write to OCW{}: {:02X} {:08b}", name, value & 8 ? 3 : 2, value, value) };
         }
     } else {
         // Data
@@ -107,7 +129,7 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
                 if (value & 7)
                     throw std::runtime_error { std::format("{}: Invalid ICW2: {:02X}", name, value) };
                 icw2_ = value;
-                std::println("{}: ICW2={:02X}", name, value);
+                LOG("{}: ICW2={:02X}", name, value);
                 if (icw1_ & ICW1_MASK_SINGLE) {
                     icwCnt_ = icw1_ & ICW1_MASK_ICW4 ? 4 : 0;
                 } else {
@@ -117,7 +139,7 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
             case 3:
                 assert(!(icw1_ & ICW1_MASK_SINGLE));
                 assert(companion_);
-                std::println("{}: ICW3={:02X}", name, value);
+                LOG("{}: ICW3={:02X}", name, value);
                 icw3_ = value;
                 icwCnt_ = icw1_ & ICW1_MASK_ICW4 ? 4 : 0;
                 if ((isSlave_ && icw3_ > 7) || (!isSlave_ && (icw3_ == 0 || (icw3_ & (icw3_ - 1)))))
@@ -127,17 +149,18 @@ void i8259a_PIC::outU8(uint16_t port, uint16_t offset, std::uint8_t value)
                 assert(icw1_ & ICW1_MASK_ICW4);
                 icw4_ = value;
                 icwCnt_ = 0;
-                std::println("{}: ICW4={:02X}", name, value);
+                LOG("{}: ICW4={:02X}", name, value);
                 if ((value & ~ICW4_MASK_SFNM) != ICW4_MASK_8086)
                     throw std::runtime_error { std::format("{}: Unsupported ICW4: {:02X}", name, value) };
                 break;
             default:
                 throw std::runtime_error { std::format("{}: Not ready (icw_cnt {}): {:02X}", name, icwCnt_, value) };
             }
-            if (!icwCnt_)
-                std::println("{}: Ready!", name);
+            if (!icwCnt_) {
+                LOG("{}: Ready!", name);
+            }
         } else {
-            LOG("{}: IMR={:02X} 0b{:08b}", name, value, value);
+            //LOG("{}: IMR={:02X} 0b{:08b}", name, value, value);
             imr_ = value;
         }
     }
@@ -157,17 +180,18 @@ int i8259a_PIC::getInterrupt()
         return -1;
 
     for (int i = 0; i < 8; ++i) {
-        const uint8_t mask = 1 << i;
+        const uint8_t intNo = (priority_ + i) % 8;
+        const uint8_t mask = 1 << intNo;
         // A higher priority interrupt is being serviced
         if (isr_ & mask)
             return -1;
         if (pending & mask) {
             irr_ &= ~mask;
             isr_ |= mask;
-            //std::println("PIC: IRQ {}", i);
+            //if (isSlave_ || intNo) std::println("PIC: IRQ {}", isSlave_ ? 8 + intNo : intNo);
             if (companion_ && !isSlave_ && (icw3_ & mask))
                 return companion_->getInterrupt();
-            return i | icw2_;
+            return intNo | icw2_;
         }
     }
     throw std::runtime_error { std::format("Internal error in getInterrupt, pending = {}", pending) };
@@ -177,22 +201,31 @@ void i8259a_PIC::setInterrupt(std::uint8_t line)
 {
     line &= 7;
     const uint8_t mask = static_cast<uint8_t>(1 << line);
+
     irr_ |= mask;
 
     if (icw1_ & ICW1_MASK_SINGLE)
         return;
 
     // Cascade mode
-    if (isSlave_) {
+    if (isSlave_)
         companion_->setInterrupt(icw3_);
-        return;
-    }   
 }
 
 void i8259a_PIC::clearInterrupt(std::uint8_t line)
 {
     line &= 7;
     irr_ &= ~(1 << line);
+    if (irr_ == 0 && !(icw1_ & ICW1_MASK_SINGLE) && isSlave_)
+        companion_->clearInterrupt(icw3_);
+}
+
+void i8259a_PIC::setLineState(std::uint8_t line, bool set)
+{
+    if (set)
+        setInterrupt(line);
+    else
+        clearInterrupt(line);
 }
 
 void i8259a_PIC::addSlave(i8259a_PIC& slave)

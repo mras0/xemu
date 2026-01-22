@@ -3,9 +3,11 @@
 #include <print>
 #include <utility>
 #include <cstring>
+#include <optional>
 
 #if 0
-#define LOG(...) std::println("ATA: " __VA_ARGS__)
+std::string CPUIPString();
+#define LOG(...) std::println("ATA: {} {}", CPUIPString() , std::format(__VA_ARGS__))
 #else
 #define LOG(...)
 #endif
@@ -49,13 +51,19 @@ constexpr uint8_t STATUS_MASK_DF = 1 << 5; // Drive fault (does not set ERR)
 constexpr uint8_t STATUS_MASK_RDY = 1 << 6; // Ready (cleared after an error)
 constexpr uint8_t STATUS_MASK_BSY = 1 << 7; // Busy
 
-enum {
+enum : uint8_t {
     ATA_CMD_READ_SECTORS_WITH_RETRY = 0x20,
     ATA_CMD_READ_SECTORS = 0x21,
     ATA_CMD_WRITE_SECTORS_WITH_RETRY = 0x30,
     ATA_CMD_WRITE_SECTORS = 0x31,
+    ATA_CMD_READ_VERIFY_SECTORS = 0x40,
+    ATA_CMD_INITIALIZE_DEVICE_PARAMETERS = 0x91,
     ATA_CMD_IDENTIFY_PACKET_DEVICE = 0xA1,
     ATA_CMD_IDENTIFY_DRIVE = 0xEC,
+};
+
+enum ErrorCode : uint8_t {
+    None = 0b001
 };
 
 bool IsWriteCommand(std::uint8_t command)
@@ -71,6 +79,8 @@ bool IsWriteCommand(std::uint8_t command)
 
 std::string CommandString(std::uint8_t command)
 {
+    if ((command & 0xF0) == 0x10)
+        return "Recalibrate (" + HexString(command) + ")";
     switch (command) {
     case ATA_CMD_READ_SECTORS_WITH_RETRY: // 20
         return "Read sector(s)";
@@ -80,6 +90,10 @@ std::string CommandString(std::uint8_t command)
         return "Write sector(s)";
     case ATA_CMD_WRITE_SECTORS: // 31
         return "Write sector(s) w/o retry";
+    case ATA_CMD_READ_VERIFY_SECTORS: // 40:
+        return "Read verify sector(s)";
+    case ATA_CMD_INITIALIZE_DEVICE_PARAMETERS: // 91
+        return "Initialize device parameters";
     case ATA_CMD_IDENTIFY_PACKET_DEVICE: // A1
         return "Identify packet device";
     case ATA_CMD_IDENTIFY_DRIVE: // EC
@@ -108,6 +122,11 @@ public:
     std::uint64_t nextAction() override;
 
     void insertDisk(uint8_t driveNum, std::string_view filename);
+    const DiskFormat& diskFormat(uint8_t driveNum) const
+    {
+        assert(driveNum < 2);
+        return drives_[driveNum].data.format();
+    }
 
 private:
     SystemBus& bus_;
@@ -119,6 +138,7 @@ private:
     uint32_t bytesRemaining_;
     uint32_t cycleCountdown_;
     uint8_t currentCommand_;
+    uint8_t error_;
     std::function<void(void)> nextTransition_;
     struct Drive {
         void reset()
@@ -137,7 +157,7 @@ private:
         }
 
         uint8_t status;
-        uint8_t sectorCount;
+        uint16_t sectorCount;
         uint32_t lba;
 
         size_t writeOffset, writeCount;
@@ -145,7 +165,7 @@ private:
 
         bool present() const
         {
-            return !data.data.empty();
+            return data.sizeInBytes() != 0;
         }
 
         uint8_t sectorNumber() const
@@ -172,39 +192,30 @@ private:
                 return std::format("CHS {}/{}/{}", cylinderNumber(), driveHead & DH_MASK_ADDR_MASK, sectorNumber());
         }
 
-        uint8_t* dataPtr(uint8_t driveHead)
+        std::optional<size_t> dataOffset(uint8_t driveHead)
         {
             uint32_t addr;
             if (!sectorCount)
-                return nullptr;
+                return {};
             if (driveHead & DH_MASK_LBA) {
                 addr = lbaAddress(driveHead);
             } else {
                 const auto c = cylinderNumber();
                 const auto h = static_cast<uint8_t>(driveHead & DH_MASK_ADDR_MASK);
                 const auto s = sectorNumber();
-                if (!data.format.validCHS(c, h, s))
-                    return nullptr;
-                addr = data.format.toLBA(c, h, s);
+                if (!data.format().validCHS(c, h, s))
+                    return {};
+                addr = data.format().toLBA(c, h, s);
             }
-            if (addr >= data.format.totalSectors() || sectorCount > data.format.totalSectors() - addr)
-                return nullptr;
+            if (addr >= data.format().totalSectors() || sectorCount > data.format().totalSectors() - addr)
+                return {};
             writeOffset = addr * bytesPerSector;
             writeCount = sectorCount * bytesPerSector;
-            return &data.data[addr * bytesPerSector];
+            return writeOffset;
         }
-
-        void afterWrite()
-        {
-            assert(writeCount);
-            data.afterWrite(writeOffset, writeCount);
-            writeOffset = 0;
-            writeCount = 0;
-        }
-
     } drives_[2];
     Drive* commandDrive_;
-    uint8_t tempBuf_[bytesPerSector];
+    std::vector<uint8_t> tempBuf_;
 
     Drive& selectedDrive()
     {
@@ -230,6 +241,13 @@ private:
 
     void cmdIdentifyDrive(Drive& drive);
     void cmdReadWriteSectors(Drive& drive);
+    void cmdIgnore(Drive& drive);
+
+    uint32_t doRead(uint8_t numBytes);
+    void doWrite(uint8_t numBytes, uint32_t value);
+    void setError(ErrorCode err);
+    void triggerIrq();
+    void commandDone();
 };
 
 ATAController::impl::impl(SystemBus& bus, uint16_t baseRegister, uint16_t controlRegister, onIrqType onIrq)
@@ -238,6 +256,7 @@ ATAController::impl::impl(SystemBus& bus, uint16_t baseRegister, uint16_t contro
     , onIRQ_ { onIrq }
 {
     bus.addIOHandler(baseRegister, 8, *this, true);
+    bus.addIOHandler(baseRegister | 0xe, 2, *this, true);
     bus.addIOHandler(controlRegister, 2, *this, true);
     bus.addCycleObserver(*this);
     reset();
@@ -256,6 +275,7 @@ void ATAController::impl::reset()
     for (auto& dr : drives_) {
         dr.reset();
     }
+    setError(ErrorCode::None);
 }
 
 void ATAController::impl::runCycles(std::uint64_t numCycles)
@@ -284,13 +304,24 @@ void ATAController::impl::insertDisk(uint8_t driveNum, std::string_view filename
         data.eject();
     } else {
         data.insert(filename);
-        LOG("{} Inserting {} {}/{}/{} {} MB", driveNum, filename, data.format.numCylinder, data.format.headsPerCylinder, data.format.sectorsPerTrack, data.format.sizeInBytes() / (1024. * 1024));
+        LOG("{} Inserting {} {}/{}/{} {} MB", driveNum, filename, data.format().numCylinder, data.format().headsPerCylinder, data.format().sectorsPerTrack, data.format().sizeInBytes() / (1024. * 1024));
     }
 }
 
 std::uint8_t ATAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
 {
+    if (isControlRegister(port) || offset != BASE_REG_STATUS_R) {
+        LOG("IN port={:04X}", port);
+    }
+
     if (isControlRegister(port)) {
+        if (offset == 0)
+            return deviceControl_;
+        else if (offset == 1) {
+            //THROW_FLIPFLOP();
+            return 0x7C | (driveHead_ & DH_MASK_DRV ? 1 : 2);
+        }
+
         LOG("TODO inu8 offset {} from control port", offset);
         return IOHandler::inU8(port, offset);
     }
@@ -298,15 +329,20 @@ std::uint8_t ATAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
     auto& dr = selectedDrive();
 
     switch (offset) {
+    case BASE_REG_ERROR_R:
+        return 0; // error_;
     case BASE_REG_SECTOR_COUNT_RW: // 2
-        return dr.sectorCount;
+        return static_cast<uint8_t>(dr.sectorCount);
     case BASE_REG_LBA_LOW_RW: // 3
         return static_cast<uint8_t>(dr.lba);
     case BASE_REG_LBA_MID_RW: // 4
         return static_cast<uint8_t>(dr.lba >> 8);
     case BASE_REG_LBA_HIGH_RW: // 5
         return static_cast<uint8_t>(dr.lba >> 16);
+    case BASE_REG_DRIVE_HEAD_RW:
+        return driveHead_;
     case BASE_REG_STATUS_R: // 7
+        onIRQ_(false);
         return dr.status | (bytesRemaining_ ? STATUS_MASK_DRQ : 0);
     }
 
@@ -316,6 +352,7 @@ std::uint8_t ATAController::impl::inU8(std::uint16_t port, std::uint16_t offset)
 
 void ATAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::uint8_t value)
 {
+    LOG("OUT port={:04X} value={:02X}", port, value);
     if (isControlRegister(port)) {
         if (offset == 0) {
             // Device control register
@@ -350,8 +387,12 @@ void ATAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::u
             return;
         break;
     case BASE_REG_SECTOR_COUNT_RW: // 2
-        if (value == 0)
-            throw std::runtime_error { "TODO: ATA sector count = 0" };
+        // 0 means 256, but OS/2 installer expects less than 7-bits to be possible
+        //dr.sectorCount = value & 0x3f;
+        if (value == 0) {
+            LOG("Warning: sector count usually means 256 sectors");
+            THROW_FLIPFLOP();
+        }
         dr.sectorCount = value;
         return;
     case BASE_REG_LBA_LOW_RW: // 3
@@ -368,9 +409,14 @@ void ATAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::u
         driveHead_ = value;
         return;
     case BASE_REG_COMMAND_W:
-        dr.status &= ~STATUS_MASK_ERR;
+        setError(ErrorCode::None);
+        dr.status &= ~(STATUS_MASK_ERR | STATUS_MASK_SRV);
         currentCommand_ = value;
         LOG("Command: {} sectorCount = {} {}", CommandString(value), dr.sectorCount, dr.addressDesc(driveHead_));
+        if ((value & 0xF0) == 0x10) {
+            startCommand(&impl::cmdIgnore);
+            return;
+        }
         switch (value) {
         case ATA_CMD_READ_SECTORS_WITH_RETRY:
         case ATA_CMD_READ_SECTORS:
@@ -378,12 +424,29 @@ void ATAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::u
         case ATA_CMD_WRITE_SECTORS:
             startCommand(&impl::cmdReadWriteSectors);
             return;
+        case ATA_CMD_READ_VERIFY_SECTORS:
+            startCommand(&impl::cmdIgnore);
+            return;
+        case ATA_CMD_INITIALIZE_DEVICE_PARAMETERS: {
+            const auto& fmt = dr.data.format();
+            const uint8_t h = static_cast<uint8_t>(driveHead_ & DH_MASK_ADDR_MASK) + 1;
+            if (dr.sectorCount != fmt.sectorsPerTrack || h != fmt.headsPerCylinder) {
+                std::println("ATA: {} {}/{} doesn't match {}", CommandString(currentCommand_), h, dr.sectorCount, fmt.headsPerCylinder, fmt.sectorsPerTrack);
+                THROW_FLIPFLOP();
+            }
+            startCommand(&impl::cmdIgnore);
+            return;
+        }
         case ATA_CMD_IDENTIFY_PACKET_DEVICE: // 0xA1
             dr.status |= STATUS_MASK_ERR;
             return;
         case ATA_CMD_IDENTIFY_DRIVE: // 0xEC
             startCommand(&impl::cmdIdentifyDrive);
             return;
+        default:
+            std::println("ATA: Unsupported command {} sectorCount = {} {}", CommandString(value), dr.sectorCount, dr.addressDesc(driveHead_));
+            THROW_FLIPFLOP();
+            dr.status |= STATUS_MASK_ERR;
         }
         break;
     }
@@ -392,47 +455,84 @@ void ATAController::impl::outU8(std::uint16_t port, std::uint16_t offset, std::u
     IOHandler::outU8(port, offset, value);
 }
 
-std::uint16_t ATAController::impl::inU16(std::uint16_t port, std::uint16_t offset)
+uint32_t ATAController::impl::doRead(uint8_t numBytes)
 {
-    if (offset != BASE_REG_DATA_RW || bytesRemaining_ < 2 || IsWriteCommand(currentCommand_))
-        throw std::runtime_error { std::format("ATA: 16-bit input not supported port={:04X} offset={:02X} (bytes remaining {}) command = {}", port, offset, bytesRemaining_, CommandString(currentCommand_)) };
-    assert(dataPtr_);
-    const auto res = GetU16(dataPtr_);
-    dataPtr_ += 2;
-    bytesRemaining_ -= 2;
+    if (bytesRemaining_ < numBytes || IsWriteCommand(currentCommand_))
+        throw std::runtime_error { std::format("ATA: Unexpected read from data port size={} bytesRemaining_={:X} {}", numBytes, bytesRemaining_, CommandString(currentCommand_)) };
+    assert(dataPtr_ && commandDrive_);
+    assert(numBytes == 2 || numBytes == 4);
+    const auto res = numBytes == 2 ? GetU16(dataPtr_) : GetU32(dataPtr_);
+    dataPtr_ += numBytes;
+    bytesRemaining_ -= numBytes;
     if (!bytesRemaining_) {
         dataPtr_ = nullptr;
-        currentCommand_ = 0;
         commandDrive_ = nullptr;
-
+        commandDone();
+    } else if (bytesRemaining_ % bytesPerSector == 0) {
+        if (!cycleCountdown_)
+            setTransition([&]() { triggerIrq(); });
+        else
+            LOG("Warning transition already active!");
     }
     return res;
 }
 
+std::uint16_t ATAController::impl::inU16(std::uint16_t port, std::uint16_t offset)
+{
+    if (offset != BASE_REG_DATA_RW)
+        throw std::runtime_error { std::format("ATA: 16-bit input not supported port={:04X} offset={:02X} (bytes remaining {}) command = {}", port, offset, bytesRemaining_, CommandString(currentCommand_)) };
+    return static_cast<uint16_t>(doRead(2));
+}
+
 std::uint32_t ATAController::impl::inU32(std::uint16_t port, std::uint16_t offset)
 {
-    throw std::runtime_error { std::format("ATA: 32-bit input not supported port={:04X} offset={:02X}", port, offset) };
+    if (offset != BASE_REG_DATA_RW)
+        throw std::runtime_error { std::format("ATA: 32-bit input not supported port={:04X} offset={:02X}", port, offset) };
+    return doRead(4);
+}
+
+void ATAController::impl::doWrite(uint8_t numBytes, uint32_t value)
+{
+    if (bytesRemaining_ < numBytes || !IsWriteCommand(currentCommand_))
+        throw std::runtime_error { std::format("ATA: Unexpected write to data port size={} value={:04X}, bytesRemaining_={:X} {}", numBytes, value, bytesRemaining_, CommandString(currentCommand_)) };
+    assert(dataPtr_ && commandDrive_);
+    assert(numBytes == 2 || numBytes == 4);
+    if (numBytes == 2)
+        PutU16(dataPtr_, static_cast<uint16_t>(value));
+    else
+        PutU32(dataPtr_, value);
+    dataPtr_ += numBytes;
+    bytesRemaining_ -= numBytes;
+    if (bytesRemaining_ % bytesPerSector == 0) {
+        if (!cycleCountdown_)
+            setTransition([&]() { triggerIrq(); });
+        else
+            LOG("Warning transition already active!");
+    }
+        
+    if (!bytesRemaining_) {
+        dataPtr_ = nullptr;
+        assert(commandDrive_->writeCount);
+        commandDrive_->data.write(&tempBuf_[0], commandDrive_->writeOffset, commandDrive_->writeCount);
+        commandDrive_->writeOffset = 0;
+        commandDrive_->writeCount = 0;
+        commandDrive_ = nullptr;
+        commandDone();
+    }
 }
 
 void ATAController::impl::outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value)
 {
-    if (offset != BASE_REG_DATA_RW || bytesRemaining_ < 2 || !IsWriteCommand(currentCommand_))
+    if (offset != BASE_REG_DATA_RW)
         throw std::runtime_error { std::format("ATA: 16-bit output not supported port={:04X} offset={:02X} (bytes remaining {}) command = {}", port, offset, bytesRemaining_, CommandString(currentCommand_)) };
-    assert(dataPtr_ && commandDrive_);
-    PutU16(dataPtr_, value);
-    dataPtr_ += 2;
-    bytesRemaining_ -= 2;
-    if (!bytesRemaining_) {
-        dataPtr_ = nullptr;
-        currentCommand_ = 0;
-        commandDrive_->afterWrite();
-        commandDrive_ = nullptr;
-    }
+    doWrite(2, value);
 }
 
 void ATAController::impl::outU32(std::uint16_t port, std::uint16_t offset, std::uint32_t value)
 {
-    throw std::runtime_error { std::format("ATA: 32-bit output not supported port={:04X} offset={:02X} value={:X}", port, offset, value) };
+    if (offset != BASE_REG_DATA_RW)
+        throw std::runtime_error { std::format("ATA: 32-bit output not supported port={:04X} offset={:02X} value={:X}", port, offset, value) };
+    doWrite(4, value);
 }
 
 
@@ -441,9 +541,11 @@ void ATAController::impl::startCommand(CommandFuncType commandFunc)
     auto& dr = selectedDrive();
     assert(!(dr.status & STATUS_MASK_BSY));
     dr.status |= STATUS_MASK_BSY;
+    dr.status &= ~STATUS_MASK_RDY;
     setTransition([this, &dr, commandFunc]() {
         assert(dr.status & STATUS_MASK_BSY);
         dr.status &= ~STATUS_MASK_BSY;
+        dr.status |= STATUS_MASK_RDY | STATUS_MASK_SRV;
         commandDrive_ = &dr;
         (*this.*commandFunc)(dr);
     });
@@ -452,9 +554,10 @@ void ATAController::impl::startCommand(CommandFuncType commandFunc)
 void ATAController::impl::cmdIdentifyDrive(Drive& drive)
 {
     assert(!dataPtr_ && !bytesRemaining_);
-    dataPtr_ = tempBuf_;
+    tempBuf_.resize(bytesPerSector);
+    dataPtr_ = &tempBuf_[0];
     bytesRemaining_ = bytesPerSector;
-    std::memset(tempBuf_, 0, bytesRemaining_);
+    std::memset(&tempBuf_[0], 0, bytesRemaining_);
 
     auto putWord = [&](uint32_t wordIndex, uint16_t value) {
         assert(wordIndex < 256);
@@ -474,36 +577,74 @@ void ATAController::impl::cmdIdentifyDrive(Drive& drive)
             dest[i ^ 1] = text[i];
     };
 
-    const auto& fmt = drive.data.format;
+    const auto& fmt = drive.data.format();
 
     putWord(0, 1 << 6); // General configuration, 6 = Fixed Disk
     putWord(1, static_cast<uint16_t>(fmt.numCylinder));
     putWord(3, static_cast<uint16_t>(fmt.headsPerCylinder));
-    putWord(4, static_cast<uint16_t>(fmt.sectorsPerTrack * bytesPerSector));
+    putWord(4, /*static_cast<uint16_t>(fmt.sectorsPerTrack * bytesPerSector)*/0);
     putWord(5, static_cast<uint16_t>(bytesPerSector));
     putWord(6, static_cast<uint16_t>(fmt.sectorsPerTrack));
     putString(10, 20, "SerialNo");
     putString(23, 8, "FirmwRev");
     putString(27, 40, "Model number!!");
-    putWord(48, 0); // bit0 = double word IO supported
-    putWord(49, 1 << 9); // bit9 = LBA supported, bit8 = DMA supported
+    putWord(47, 16); // max sectors per interrupt
+    putWord(48, 1); // bit0 = double word IO supported
+    putWord(49, 1 << 9 /*| 1 << 8*/); // bit9 = LBA supported, bit8 = DMA supported
+    putWord(53, 7); // Mark 54-58 / 64-70 as valid
     putWord(54, static_cast<uint16_t>(fmt.numCylinder));
     putWord(55, static_cast<uint16_t>(fmt.headsPerCylinder));
     putWord(56, static_cast<uint16_t>(fmt.sectorsPerTrack));
     putDword(57, fmt.totalSectors());
     putWord(59, 0); // bit 8 = multiple sector command valid, bit 7-0 = max sectors supported for mulitple r/w
     putDword(60, fmt.totalSectors());
+ //   putWord(80, 1 << 2 | 1 << 1); // Major version = ATA-2 (bit 1 = ATA-1, bit 2 = ATA-2, etc.)
+//    HexDump(0, dataPtr_, 512);
+    triggerIrq();
+    commandDone();
 }
 
 void ATAController::impl::cmdReadWriteSectors(Drive& drive)
 {
     //assert(!dataPtr_ && !bytesRemaining_);
-    dataPtr_ = drive.dataPtr(driveHead_);
-    if (!dataPtr_)
+    //dataPtr_ = drive.dataPtr(driveHead_);
+    auto offset = drive.dataOffset(driveHead_);
+    if (!offset)
         throw std::runtime_error { std::format("TODO: {} invalid sectorCount = {} {}", CommandString(currentCommand_), drive.sectorCount, drive.addressDesc(driveHead_)) };
-    if (!IsWriteCommand(currentCommand_))
-        drive.writeCount = 0;
     bytesRemaining_ = bytesPerSector * drive.sectorCount;
+    tempBuf_.resize(bytesRemaining_);
+    dataPtr_ = &tempBuf_[0];
+    if (!IsWriteCommand(currentCommand_)) {
+        drive.writeCount = 0;
+        drive.data.read(&tempBuf_[0], *offset, bytesRemaining_);
+        triggerIrq();
+    }
+}
+
+void ATAController::impl::cmdIgnore(Drive& drive)
+{
+    drive.status &= ~(STATUS_MASK_DF | STATUS_MASK_ERR);
+    triggerIrq();
+    commandDone();
+}
+
+void ATAController::impl::setError(ErrorCode err)
+{
+    error_ = (driveHead_ & DH_MASK_DRV ? 0x80 : 0x00) | static_cast<uint8_t>(err);
+}
+
+void ATAController::impl::triggerIrq()
+{
+    if (!(deviceControl_ & DC_MASK_nIEN)) {
+        LOG("Triggering IRQ");
+        onIRQ_(true);
+    }
+}
+
+void ATAController::impl::commandDone()
+{
+    LOG("ATA: {} done, status = {:02X} {}", CommandString(currentCommand_), selectedDrive().status | (bytesRemaining_ ? STATUS_MASK_DRQ : 0), deviceControl_ & DC_MASK_nIEN ? "" : "triggering IRQ");
+    currentCommand_ = 0;
 }
 
 ATAController::ATAController(SystemBus& bus, uint16_t baseRegister, uint16_t controlRegister, onIrqType onIrq)
@@ -516,4 +657,9 @@ ATAController::~ATAController() = default;
 void ATAController::insertDisk(uint8_t driveNum, std::string_view filename)
 {
     impl_->insertDisk(driveNum, filename);
+}
+
+const DiskFormat& ATAController::diskFormat(uint8_t driveNum) const
+{
+    return impl_->diskFormat(driveNum);
 }

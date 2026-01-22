@@ -6,6 +6,12 @@
 extern const Instruction InstructionTable_8086[256];
 extern const uint32_t HasModrm1_8086[256 / 32];
 
+extern const Instruction InstructionTable_80286[256];
+extern const uint32_t HasModrm1_80286[256 / 32];
+
+extern const Instruction InstructionTable_0F_80286[256];
+extern const uint32_t HasModrm2_80286[256 / 32];
+
 extern const Instruction InstructionTable_80386[256];
 extern const uint32_t HasModrm1_80386[256 / 32];
 

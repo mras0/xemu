@@ -6,6 +6,30 @@
 #include <cassert>
 #include <algorithm>
 
+const char* CPUModelText(CPUModel model)
+{
+    switch (model) {
+    case CPUModel::i8088:
+        return "8088";
+    case CPUModel::i8086:
+        return "8086";
+    case CPUModel::i80186:
+        return "80186";
+    case CPUModel::i80286:
+        return "80286";
+    case CPUModel::i80386sx:
+        return "80386SX";
+    case CPUModel::i80386:
+        return "80386DX";
+    case CPUModel::i80486:
+        return "80486";
+    case CPUModel::i80586:
+        return "80586";
+    default:
+        return "Invalid CPUModel";
+    }
+}
+
 std::string ModrmString(uint8_t modrm)
 {
     return "Mod=" + BinString(ModrmMod(modrm), 2) + " Reg=" + BinString(ModrmReg(modrm), 3) + " R/M=" + BinString(ModrmRm(modrm), 3);
@@ -118,6 +142,13 @@ static constexpr DecodeTables decodeTable_8086 = {
     nullptr,
 };
 
+static constexpr DecodeTables decodeTable_80286 = {
+    InstructionTable_80286,
+    HasModrm1_80286,
+    InstructionTable_0F_80286,
+    HasModrm2_80286,
+};
+
 static constexpr DecodeTables decodeTable_80386 = {
     InstructionTable_80386,
     HasModrm1_80386,
@@ -131,6 +162,8 @@ static const DecodeTables& GetDecodeTable(const CPUInfo& info)
     case CPUModel::i8088:
     case CPUModel::i8086:
         return decodeTable_8086;
+    case CPUModel::i80286:
+        return decodeTable_80286;
     case CPUModel::i80386sx:
     case CPUModel::i80386:
     case CPUModel::i80586: // For now
@@ -533,7 +566,7 @@ InstructionDecodeResult Decode(const CPUInfo& cpuInfo, std::function<std::uint8_
             assert(hasModrm);
             ea.type = DecodedEAType::sreg;
             ea.regNum = ModrmReg(modrm);
-            if (cpuInfo.model < CPUModel::i80386sx)
+            if (cpuInfo.model < CPUModel::i80286)
                 ea.regNum &= 3; // Only lower two bits used
             break;
         case OperandMode::MwRv:

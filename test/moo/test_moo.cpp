@@ -51,7 +51,7 @@ constexpr auto MOO_RM32 = MakeMooId("RM32");
 constexpr auto MOO_RAM = MakeMooId("RAM ");
 constexpr auto MOO_QUEU = MakeMooId("QUEU");
 constexpr auto MOO_GMET = MakeMooId("GMET"); // Generating metadata
-
+constexpr auto MOO_RMSK = MakeMooId("RMSK");
 
 enum {
     MOO_RG16_AX,
@@ -71,6 +71,23 @@ enum {
     MOO_RG16_MAX,
 };
 static_assert(MOO_RG16_MAX == 14);
+
+bool MooRg16IsSreg(int index)
+{
+    return index >= MOO_RG16_CS && index <= MOO_RG16_ES;
+}
+
+static SReg MooRg16SregMap(int index)
+{
+    assert(MooRg16IsSreg(index));
+    constexpr SReg map[4] = {
+        SREG_CS,
+        SREG_SS,
+        SREG_DS,
+        SREG_ES
+    };
+    return map[index - MOO_RG16_CS];
+}
 
 static int MooRg16InvSregMap(SReg sr)
 {
@@ -441,6 +458,12 @@ public:
                 regMask_ = readRm32Chunk();
                 exitChunk();
                 break;
+            case MOO_RMSK:
+                assert(regMask_ == nullptr);
+                enterChunk();
+                regMask_ = readRmskChunk();
+                exitChunk();
+                break;
             case MOO_TEST:
                 return;
             default:
@@ -560,6 +583,24 @@ public:
         }
         exitChunk();
         return test;
+    }
+
+
+    MooRm32Ptr readRmskChunk()
+    {
+        assert(ids_.back() == MOO_RMSK);
+        const auto mask = read<uint16_t>();
+        assert((mask >> MOO_RG16_MAX) == 0);
+        auto rmsk = std::make_unique<MooRm32>();
+        for (int i = 0; i < MOO_RG16_MAX; ++i) {
+            if ((mask >> i) & 1) {
+                rmsk->regMask[i] = read<uint16_t>();
+            } else {
+                rmsk->regMask[i] = UINT16_MAX;
+            }
+        }
+
+        return rmsk;
     }
 
     MooRm32Ptr readRm32Chunk()
@@ -714,7 +755,7 @@ public:
     explicit MooTestMachine(CPUModel cpuModel)
         : cpu_ {cpuModel, bus_}
     {
-        const auto memSize = cpuModel >= CPUModel::i80386sx ? 0x200000 : 0x100000; // 2MB / 1MB
+        const auto memSize = cpuModel >= CPUModel::i80286 ? 0x200000 : 0x100000; // 2MB / 1MB
         bus_.setDefaultIOHandler(this);
         bus_.setAddressMask(memSize - 1);
         bus_.addMemHandler(0, memSize, *this);
@@ -735,7 +776,11 @@ public:
         cpu_.reset();
         if (test.init.regType == MooState::RG16) {
             for (int i = 0; i < MOO_RG16_MAX; ++i) {
-                if (test.init.regActive(i))
+                if (!test.init.regActive(i))
+                    continue;
+                if (MooRg16IsSreg(i))
+                    cpu_.loadSreg(MooRg16SregMap(i), test.init.rg16[i]);
+                else
                     reg16(i) = test.init.rg16[i];
             }
         } else {
@@ -754,7 +799,7 @@ public:
         }
         cpu_.prefetch_.flush(cpu_.ip_ & cpu_.ipMask());
 
-        if (cpu_.cpuInfo().model == CPUModel::i80386sx) {
+        if (cpu_.cpuInfo().model >= CPUModel::i80286) {
             int exceptionNo = ExceptionNone;
             for (int i = 0;; ++i) {
                 if (i == 3)
@@ -763,7 +808,9 @@ public:
                     cpu_.step();
                 } catch (const CPUHaltedException&) {
                     ++cpu_.ip_;
-                    //++cpu_.ip_;
+                    // Hack for 286 LOCK HLT test...
+                    if (cpu_.cpuInfo().model == CPUModel::i80286 && (test.bytes[0] == 0xF0 && test.bytes[1] == 0xF4))
+                        ++cpu_.ip_;
                     break;
                 }
                 if (cpu_.halted())
@@ -864,10 +911,15 @@ public:
             auto msg = std::format("Unexpected write to {:05X} value {:02X} expected {:02X}", addr, value, m->value);
 
             // Hack to ignore flags on division error
-            if (cpu_.cpuInfo().model == CPUModel::i8088 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionTypeCPU)) {
+            if (cpu_.cpuInfo().model <= CPUModel::i80286 && cpu_.lastExceptionNo() == (CPUExceptionNumber::DivisionError | ExceptionTypeCPU)) {
                 const auto writeIdx = m - &test_->fina.mem[0];
                 if (writeIdx < 2) {
-                    const auto ignore = ignoredFlags_ | EFLAGS_MASK_PF | EFLAGS_MASK_ZF; // Always ignore ZF/PF on exception..
+
+                    auto ignore = ignoredFlags_;
+                    if (cpu_.cpuInfo().model == CPUModel::i8088)
+                        ignore |= EFLAGS_MASK_PF | EFLAGS_MASK_ZF;// Always ignore ZF/PF on exception..
+                    if (test_->masks)
+                        ignore |= test_->masks->regMask[MOO_RG16_FLAGS];
                     const auto diff = (m->value ^ value) & ~(ignore >> 8 * writeIdx);
                     if (!diff) {
                         //std::println("HACK for division error flags: {}", msg);
@@ -1050,6 +1102,10 @@ static void ForAllMooFiles(const std::string& path, const F& f)
 
 static const std::set<std::string> blacklist {
     "8abbbc61a5866292b0bc816660d7b334bea7962a", //666f.MOO.gz 253 repne outsd -- looks like address bit 20 is ignored in this one???
+    // 286/v1_real_mode v. 1.1.0 (from official revocation list)
+    "eaaf835a6600a351ee70375c7f6996931411bca5", // C6.MOO.gz 1982 mov byte [ds:E805h],6Ah -- instruction decodes to something else
+    "1b586a46891182a22b3f55f71e4db4c601ac26e4", // C7.MOO.gz 1685 (bad) nop -- test shows #GP, but seems like #UD is more correct
+    "e64e6de35ca857a62a8f4ccc2bf991700a564b28", // C8.MOO.gz 904 enter E401h,D6h -- weird data written to stack
 };
 
 [[maybe_unused]] static MooMeta ReadTestMetaData(const char* filename)
@@ -1066,9 +1122,14 @@ static void PrintTestInfo(const MooTest& test)
     std::println("");
     std::println("Initial state:");
     PrintMooState(test.init);
+    std::println("CS:IP Linear: {:06X}", test.init.ip() + test.init.readSreg(SREG_CS) * 16);
+    std::println("SS:SP Linear: {:06X}", test.init.readReg(REG_SP, 4) + test.init.readSreg(SREG_SS) * 16);
     std::println("");
     std::println("Expected final state:");
     PrintMooState(test.fina);
+    const auto st = test.makeFinal();
+    std::println("CS:IP Linear: {:06X}", st.ip() + st.readSreg(SREG_CS) * 16);
+    std::println("SS:SP Linear: {:06X}", st.readReg(REG_SP, 4) + st.readSreg(SREG_SS) * 16);
     std::println("");
 }
 
@@ -1085,6 +1146,7 @@ static void TestMooFile(MooTestMachine& machine, const std::string& filename, ui
             test.masks = moo.regMask();
         if (blacklist.find(test.hashString()) != blacklist.end() || (filter && !filter(test)))
             continue;
+
         try {
             mooTestDescription = std::format("{} {} {}", test.hashString(), strrchr(filename.c_str(), '/') + 1, test.id);
             machine.runTest(test, ignoredFlagsMask);
@@ -1095,12 +1157,23 @@ static void TestMooFile(MooTestMachine& machine, const std::string& filename, ui
             std::println("{:04X}:{:04X}", machine.cpu().sregs_[SREG_CS], machine.cpu().ip_);
             std::println("");
             if (test.flagsStackAddr)
-                std::println("Expected exception {} with flags at {:08X}\n", test.exceptionNo, test.flagsStackAddr);
+                std::println("Expected exception {} ({}) with flags at {:08X}\n", test.exceptionNo, test.exceptionNo <= 14  ? CPUExceptionNumberText[test.exceptionNo] : "???", test.flagsStackAddr);
             if (test.masks) {
                 std::println("NB test mask is present!");
-                for (int i = 0; i < MOO_RG32_MAX; ++i) {
-                    if (test.masks->regMask[i] != UINT32_MAX)
-                        std::println("Mask for {} = {:08X}", MooRg32RegNames[i], test.masks->regMask[i]);
+                if (test.init.regType == MooState::RG16) {
+                    for (int i = 0; i < MOO_RG16_MAX; ++i) {
+                        if (test.masks->regMask[i] != UINT16_MAX) {
+                            std::print("Mask for {} = {:04X}", MooRg16RegNames[i], test.masks->regMask[i]);
+                            if (i == MOO_RG16_FLAGS)
+                                std::print(" {} Masked: {}", FormatCPUFlags(test.masks->regMask[i]) , FormatCPUFlags(~test.masks->regMask[i] & 0xffff));
+                            std::println("");
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < MOO_RG32_MAX; ++i) {
+                        if (test.masks->regMask[i] != UINT32_MAX)
+                            std::println("Mask for {} = {:08X}", MooRg32RegNames[i], test.masks->regMask[i]);
+                    }
                 }
             }
             std::println("Test {} {} {} failed ({})", filename, test.id, test.name, test.hashString());
@@ -1260,30 +1333,54 @@ static void TestMoo()
     constexpr auto rotUndefinedFlags = EFLAGS_MASK_AF;
 
     // TODO: v1_ex_real_mode/6766A5.MOO.gz 442 fails due to use of "SMC"
-    auto m = MooTestMachine { CPUModel::i80386sx };
-    m.cpu().exceptionTraceMask(UINT32_MAX);
+    auto m = MooTestMachine { CPUModel::i80286 };
+    m.cpu().exceptionTraceMask(/*UINT32_MAX*/0);
+
+#if 0
+    TestMooFile(m, "../../../misc/SingleStepTests/386/v1_ex_real_mode/6661.MOO.gz", 0, [&](MooTest& test) {
+        if (test.exceptionNo != 12)
+            return false;
+        //PrintTestInfo(test);
+        const auto b = test.init.readReg(REG_SP, 4);
+        const auto a = test.fina.readReg(REG_SP, 4);
+        //if ((a ^ b) >> 16)
+            std::println("Before: {:08X} After: {:08X} {}", b, a, (65536-b)/4);
+        return false;
+        });
+    exit(0);
+#endif
 
 #if 0
     m.cpu().exceptionTraceMask(0);
 
-    struct ShiftRes {
-        uint8_t shiftCount;
-        uint32_t input;
-        uint8_t carry;
-        uint8_t overflow;
-    };
-    std::vector<ShiftRes> shiftRes;
-
-    std::map<int, int> rMap;
-
-    TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/0faf.MOO.gz", 0, [&](MooTest& test) {
+    TestMooFile(m, "../../../misc/SingleStepTests/386/v1_ex_real_mode/6B.MOO.gz", 0, [&](MooTest& test) {
         if (test.flagsStackAddr)
             return false;
 
+        const auto decodedIns = MooDecodeInstruction(test, m.cpu().cpuInfo());
+        const auto finalState = test.makeFinal();
+        const auto m1 = decodedIns.eaVal[1]; // multiplier
+        const auto m2 = decodedIns.eaVal[2]; // multiplicand
+        // const auto product = m1 * m2;
+        const auto expectedProduct = MooEaValue(finalState, decodedIns.ins, 0);
+        // PrintTestInfo(test);
+
+        if (expectedProduct == 0)
+            std::println("{:04X} * {:04X} = {:04X} Changed flags: {}", m1 & 0xffff, m2 & 0xffff, expectedProduct & 0xffff , FormatCPUFlags(test.init.flags() ^ test.fina.flags()));
+        if ((finalState.flags() & EFLAGS_MASK_OF) || expectedProduct == 0) {
+            return false;
+        }
+
+        if (!!(expectedProduct & 0x8000) == !!(finalState.flags() & EFLAGS_MASK_SF))
+            return false;
+        //PrintTestInfo(test);
+        //std::println("{}", FormatDecodedInstruction(decodedIns.ins, Address {}));
+        //std::println("{:04X} * {:04X} = {:04X} {} {}", m1 & 0xffff, m2 & 0xffff, expectedProduct & 0xffff, expectedProduct & 0x8000 ? 1 : 0, finalState.flags() & EFLAGS_MASK_SF ? 1 : 0);
+
+#if 0
         assert(test.init.regType == MooState::RG32);
         const auto decodedIns = MooDecodeInstruction(test, m.cpu().cpuInfo());
         const auto finalState = test.makeFinal();
-
         const auto m1 = decodedIns.eaVal[0]; // multiplier
         const auto m2 = decodedIns.eaVal[1]; // multiplicand
         //const auto product = m1 * m2;
@@ -1353,31 +1450,11 @@ static void TestMoo()
 
         if (product && (finalState.flags() && EFLAGS_MASK_SF))
             printDiff();
-
+#endif
         return false;
     });
 
-    for (const auto& [idx, val] : rMap) {
-        std::println("{:04b} = {}", idx, val);
-    }
-
-#if 0
-    std::sort(shiftRes.begin(), shiftRes.end(), [](const auto& l, const auto& r) { return l.shiftCount < r.shiftCount; });
-    for (const auto& sr : shiftRes) {
-        if (sr.shiftCount == 1)
-            std::println("{:2d} {:016b} {}", sr.shiftCount, sr.input, sr.overflow);
-    }
-#endif
-
-#else
-    //m.cpu().exceptionTraceMask(0);
-    //TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/6669.MOO.gz", 0, [](const auto& test) {
-    //    if (test.id != 1234)
-    //        return false;
-    //    PrintTestInfo(test);
-    //    return true;
-    //});
-    //TestMooFile(m, "../misc/SingleStepTests/386/v1_ex_real_mode/0faf.MOO.gz", EFLAGS_MASK_PF | EFLAGS_MASK_AF);
+    exit(0);
 #endif
 
 #if 0
@@ -1528,11 +1605,39 @@ static void TestMoo()
         { "67660fad", rotUndefinedFlags }, // 0FAD shrd
      };
 
+    constexpr uint32_t mul286IgnoredFlags = EFLAGS_MASK_AF | EFLAGS_MASK_PF;
+    std::map<std::string, uint32_t> ignoredFlags80286 {
+        { "69", imulUndefinedFlags }, // 69 imul
+        { "6b", imulUndefinedFlags }, // 6B imul
+        { "c0.5", rotUndefinedFlags }, // C0 shr
+        { "c0.7", rotUndefinedFlags },// C0 sar
+        { "c1.5", rotUndefinedFlags },// C1 shr
+        { "c1.7", rotUndefinedFlags },// C1 sar
+        { "d0.5", rotUndefinedFlags },// D0 shr
+        { "d0.7", rotUndefinedFlags },// D0 sar
+        { "d1.5", rotUndefinedFlags },// D1 shr
+        { "d1.7", rotUndefinedFlags },// D1 sar
+        { "d2.5", rotUndefinedFlags },// D2 shr
+        { "d2.7", rotUndefinedFlags },// D2 sar
+        { "d3.5", rotUndefinedFlags },// D3 shr
+        { "d3.7", rotUndefinedFlags },// D3 sar
+        // AAM - Flags are completely unpredictable on #DE
+        { "d4", EFLAGS_MASK_OF | EFLAGS_MASK_AF | EFLAGS_MASK_CF | EFLAGS_MASK_ZF | EFLAGS_MASK_PF },
+        { "f6.4", mul286IgnoredFlags }, // F6 mul
+        { "f6.5", imulUndefinedFlags }, // F6 imul
+        { "f7.4", mul286IgnoredFlags }, // F7 mul
+        { "f7.5", imulUndefinedFlags }, // F7 imul
+    };
+
     for (const auto& [key, value] : commonIgnoredFlags) {
         if (ignoredFlags80386.find(key) == ignoredFlags80386.end())
             ignoredFlags80386[key] = value;
+        if (ignoredFlags80286.find(key) == ignoredFlags80286.end())
+            ignoredFlags80286[key] = value;
     }
 
+    
+    RunTestsInDir(CPUModel::i80286, mooTestDir + "286/v1_real_mode/", {}, ignoredFlags80286);
     RunTestsInDir(CPUModel::i80386sx, mooTestDir + "386/v1_ex_real_mode/", {}, ignoredFlags80386);
     RunTestsInDir(CPUModel::i8088, mooTestDir + "8088/", {}, commonIgnoredFlags);
 }

@@ -7,6 +7,7 @@
 
 #include "cpu.h"
 #include "system_bus.h"
+#include "event.h"
 
 class DebuggerMemState {
 public:
@@ -29,6 +30,7 @@ public:
     explicit Debugger(CPU& cpu, SystemBus& bus);
 
     using FunctionCallback = std::function<void (DebuggerInterface&, std::string_view)>;
+    using EventCallback = std::function<void (const Event&)>;
 
     void check(void);
     void commandLoop(void);
@@ -38,6 +40,10 @@ public:
     void setOnActive(const std::function<void(bool)>& onSetActive)
     {
         onSetActive_ = onSetActive;
+    }
+    void setEventCallback(const EventCallback& eventCallback)
+    {
+        eventCallback_ = eventCallback;
     }
 
     void registerFunction(const std::string& name, const FunctionCallback& callback);
@@ -60,6 +66,7 @@ private:
     uint32_t traceCount_ = 0;
     std::function<void (bool)> onSetActive_;
     std::map<std::string, FunctionCallback> functions_;
+    EventCallback eventCallback_;
 
     BreakPoint& getFreeBreakPoint();
     bool checkBreakPoint(const BreakPoint& bp);

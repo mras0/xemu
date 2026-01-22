@@ -148,7 +148,7 @@ void BiosReplacement::impl::insertDisk(uint8_t drive, std::string_view filename)
         LOG("Inserting disk in drive {:02X}: {:?}", drive, filename);
     dr.diskData.insert(filename);
     dr.clearStatus();
-    const auto& fmt = dr.diskData.format;
+    const auto& fmt = dr.diskData.format();
     LOG("Format: {}/{}/{}", fmt.numCylinder, fmt.headsPerCylinder, fmt.sectorsPerTrack);
 }
 
@@ -291,10 +291,10 @@ void BiosReplacement::impl::int13h_diskOp(uint8_t op)
 
     auto drive = getDrive(driveNum);
     CHECK_DISK_PARAMETER(drive != nullptr);
-    CHECK_DISK_PARAMETER(drive->diskData.format.validCHS(cylinder, head, sectorNumber));
-    const auto srcAddr = drive->diskData.format.toLBA(cylinder, head, sectorNumber) * bytesPerSector;
+    CHECK_DISK_PARAMETER(drive->diskData.format().validCHS(cylinder, head, sectorNumber));
+    const auto srcAddr = drive->diskData.format().toLBA(cylinder, head, sectorNumber) * bytesPerSector;
     const auto byteCount = bytesPerSector * numSectors;
-    CHECK_DISK_PARAMETER(srcAddr + byteCount <= drive->diskData.data.size());
+    CHECK_DISK_PARAMETER(srcAddr + byteCount <= drive->diskData.sizeInBytes());
 
     // Note: Verify doesn't actually compare data, it just checks that it was written correctly.
     if (op == 4) {
@@ -302,18 +302,22 @@ void BiosReplacement::impl::int13h_diskOp(uint8_t op)
         return;
     }
 
-    for (uint32_t i = 0; i < byteCount; ++i) {
-        const auto addr = (seg * 16) + ((ofs + i) & 0xffff);
-        ///const auto addr = (seg * 16) + (ofs + i);
+    for (uint32_t secCnt = 0; secCnt < numSectors; ++secCnt) {
+        uint8_t buffer[bytesPerSector];
         if (op == 2) {
-            bus_.writeU8(addr, drive->diskData.data[srcAddr + i]);
-        } else if (op == 3) {
-            drive->diskData.data[srcAddr + i] = bus_.readU8(addr);
+            drive->diskData.read(buffer, srcAddr + secCnt * bytesPerSector, bytesPerSector);
+            for (uint32_t i = 0; i < bytesPerSector; ++i) {
+                const auto addr = (seg * 16) + ((ofs + secCnt * bytesPerSector + i) & 0xffff);
+                bus_.writeU8(addr, buffer[i]);
+            }
+        } else {
+            for (uint32_t i = 0; i < bytesPerSector; ++i) {
+                const auto addr = (seg * 16) + ((ofs + secCnt * bytesPerSector + i) & 0xffff);
+                buffer[i] = bus_.readU8(addr);
+            }
+            drive->diskData.write(buffer, srcAddr + secCnt * bytesPerSector, bytesPerSector);
         }
     }
-
-    if (op == 3)
-        drive->diskData.afterWrite(srcAddr, byteCount);
 
     int13h_setStatus(drive, DiskStatus::Success);
 }
@@ -323,13 +327,14 @@ void BiosReplacement::impl::int13h_08_getDriveParameters()
     const auto driveNum = GET_REG8L(DX);
     LOG("INT13h/08 Get Drive Paramters drive = {:02X}", driveNum);
     auto drive = getDrive(driveNum);
+    const auto& fmt = drive->diskData.format();
     CHECK_DISK_PARAMETER(drive != nullptr);
-    CHECK_DISK_PARAMETER(drive->diskData.format.numCylinder != 0);
-    const auto cylMax = drive->diskData.format.numCylinder - 1;
+    CHECK_DISK_PARAMETER(fmt.numCylinder != 0);
+    const auto cylMax = fmt.numCylinder - 1;
     SET_REG8L(BX, 0); // BL = drive type (ignore)
     SET_REG8H(CX, static_cast<uint8_t>(cylMax)); // CH = low eight bits of maximum cylinder number
-    SET_REG8L(CX, static_cast<uint8_t>(((cylMax >> 2) & 0xC0) | drive->diskData.format.sectorsPerTrack));
-    SET_REG8H(DX, static_cast<uint8_t>(drive->diskData.format.headsPerCylinder - 1));
+    SET_REG8L(CX, static_cast<uint8_t>(((cylMax >> 2) & 0xC0) | fmt.sectorsPerTrack));
+    SET_REG8H(DX, static_cast<uint8_t>(fmt.headsPerCylinder - 1));
     SET_REG8L(DX, bus_.readU8(0x475)); // DL = number of harddrives
     int13h_setStatus(drive, DiskStatus::Success);
 }

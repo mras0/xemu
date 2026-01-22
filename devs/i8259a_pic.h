@@ -12,9 +12,11 @@ public:
     std::uint8_t inU8(uint16_t port, uint16_t offset) override;
     void outU8(uint16_t port, uint16_t offset, std::uint8_t value) override;
 
+    uint8_t pendingMask() const;
     int getInterrupt(); // -1 -> No interrupt
     void setInterrupt(std::uint8_t line);
     void clearInterrupt(std::uint8_t line);
+    void setLineState(std::uint8_t line, bool set);
 
     void addSlave(i8259a_PIC& slave);
 
@@ -29,12 +31,12 @@ private:
     uint8_t isr_; // In-Service Register
     uint8_t imr_; // Interrupt Mask Register
 
+    uint8_t priority_;
+
     i8259a_PIC* companion_ = nullptr;
     bool isSlave_ = false;
 
     uint8_t nextReg_;
-
-    uint8_t pendingMask() const;
 };
 
 enum : uint8_t {

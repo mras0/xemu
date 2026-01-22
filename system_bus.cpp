@@ -3,11 +3,14 @@
 #include <print>
 #include <stdexcept>
 #include <utility>
+#include <set>
 
 std::uint8_t IOHandler::inU8(std::uint16_t port, std::uint16_t)
 {
     std::println("Unspported 8-bit I/O input from port 0x{:04X}", port);
-    THROW_FLIPFLOP();
+    static std::set<uint16_t> ignored;
+    if (ignored.insert(port).second)
+        THROW_FLIPFLOP();
     return 0xFF;
 }
 
@@ -26,7 +29,9 @@ std::uint32_t IOHandler::inU32(std::uint16_t port, std::uint16_t offset)
 void IOHandler::outU8(std::uint16_t port, std::uint16_t, std::uint8_t value)
 {
     std::println("Unspported 8-bit I/O output to port 0x{:04X} value=0x{:02X}", port, value);
-    THROW_FLIPFLOP();
+    static std::set<uint16_t> ignored;
+    if (ignored.insert(port).second)
+        THROW_FLIPFLOP();
 }
 
 void IOHandler::outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value)
@@ -78,10 +83,11 @@ T SystemBus::read(std::uint64_t addr)
         }
     }
     std::println("Read of size {} from unmmaped address {:X}", sizeof(T), addr);
-    if constexpr (sizeof(T) == 1)
-        return 0xF4; // HLT opcode
-    else
-        return static_cast<T>(~T(0));
+    return static_cast<T>(0xF4F4F4F4F4F4F4F4);
+    //if constexpr (sizeof(T) == 1)
+    //    return 0xF4; // HLT opcode
+    //else
+    //    return static_cast<T>(~T(0));
 }
 
 template <typename T>
@@ -91,11 +97,14 @@ void SystemBus::write(std::uint64_t addr, T value)
     addr &= addressMask_;
 
     #if 0
-    const auto watchAddr = 0x00489E94 + 1;
-    if (addr <= watchAddr && addr + sizeof(T) - 1 >= watchAddr) {
+    const auto watchAddr = 0x00F31F96;
+    const auto watchSize = 4;
+    const auto watchEnd = watchAddr + watchSize - 1;
+    if (addr <= watchEnd && addr + sizeof(T) - 1 >= watchAddr) {
         extern std::string CPUIPString();
-        std::println(stderr, ">>>>>>>>> {} Write of size {} to address {:X} value={:0{}X}", CPUIPString(), sizeof(T), addr, value, sizeof(T) * 2);
-        //THROW_FLIPFLOP();
+        std::println(stdout, ">>>>>>>>> {} Write of size {} to address {:X} value={:0{}X}", CPUIPString(), sizeof(T), addr, value, sizeof(T) * 2);
+        //if constexpr (sizeof(T) != 1)
+        //    THROW_FLIPFLOP();
     }
     #endif
 
@@ -129,11 +138,14 @@ void SystemBus::addCycles(std::uint64_t count)
 {
     // Originally the system clock was 14.31818 MHz, /3 -> 4.77MHz for the CPU and /4 -> 3.579545 MHz for NTSC
     count *= 3;
-
-    count *= 2; // Fudge factor...
-    cycles_ += count;
-    if (cycles_ >= nextAction_)
-        runCycles();
+    count *= 2; // Fudge factor... (Roughly matches for 8088)
+    rawCycles_ += count;
+    if (auto scaled = rawCycles_ >> clockScale_; scaled) {
+        cycles_ += scaled;
+        rawCycles_ -= scaled << clockScale_;
+        if (cycles_ >= nextAction_)
+            runCycles();
+    }
 }
 
 void SystemBus::runCycles()

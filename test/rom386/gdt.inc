@@ -35,6 +35,9 @@ GDT_SEL_NULL2  EQU 0x60
 GDT_SEL_LDT    EQU 0x68
 GDT_SEL_USER32 EQU 0x70
 GDT_SEL_UD32   EQU 0x78
+GDT_SEL_DOWN   EQU 0x80
+GDT_SEL_SCRATCH EQU 0x88
+GDT_SEL_CALL32 EQU 0x90
 
 %macro GDT_TABLE 0
         dd              0,0
@@ -59,4 +62,12 @@ GDT_SEL_UD32   EQU 0x78
         GDT_ENTRY       LDT_BASE,LDT_SIZE-1,GDT_ACCESS_MASK_P|0x2,0 ; LDT
         GDT_ENTRY       0,0xfffff,GDT_ACCESS_CODE|3<<GDT_ACCESS_BIT_DPL,GDT_FLAG_MASK_DB|GDT_FLAG_MASK_G ; 32-bit code (DPL=3)
         GDT_ENTRY       0,0xfffff,GDT_ACCESS_DATA|3<<GDT_ACCESS_BIT_DPL,GDT_FLAG_MASK_DB|GDT_FLAG_MASK_G ; 32-bit data (DPL=3)
+        GDT_ENTRY       0,0x8000,GDT_ACCESS_DATA|3<<GDT_ACCESS_BIT_DPL|GDT_ACCESS_MASK_DC,0 ; 16-bit expand down (DPL=3)
+        GDT_ENTRY       0,0xfffff,GDT_ACCESS_CODE,GDT_FLAG_MASK_DB|GDT_FLAG_MASK_G ; GDT_SEL_SCRATCH
+        ; GDT_SEL_CALL32
+        dw              0 ; offset 15:00
+        dw              GDT_SEL_CODE32 ; selector
+        db              1 ; paramter count
+        db              GDT_ACCESS_MASK_P|3<<GDT_ACCESS_BIT_DPL|0xC ; DPL=3, 32-bit call gate
+        dw              0 ; offset 31:16
 %endmacro

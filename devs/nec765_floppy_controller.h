@@ -17,6 +17,7 @@ public:
 
     void insertDisk(uint8_t drive, const std::vector<uint8_t>& data);
     void insertDisk(uint8_t drive, std::string_view filename);
+    std::vector<uint8_t> exportDisk(uint8_t drive);
 
 private:
     class impl;

@@ -1,7 +1,6 @@
 #include <print>
 #include <stdexcept>
 #include <functional>
-#include <fstream>
 #include <cstring>
 #include "address.h"
 #include "fileio.h"
@@ -18,7 +17,6 @@
 #include "devs/i8237a_dma_controller.h"
 #include "devs/i8042_ps2_controller.h"
 #include "devs/ata_controller.h"
-#include "bios_replacement.h"
 #include "disk_data.h"
 
 static constexpr bool egaOnly = false;
@@ -179,10 +177,21 @@ private:
     }
 };
 
+std::uint8_t CalcClockScale(CPUModel model)
+{
+    if (model > CPUModel::i80386)
+        return 5;
+    if (model > CPUModel::i80286)
+        return 4;
+    if (model > CPUModel::i8088)
+        return 2;
+    return 0;
+}
+
 class BaseMachine {
 public:
     explicit BaseMachine(CPUModel model, uint32_t baseMemSize = 640*1024)
-        : bus { }
+        : bus { CalcClockScale(model) }
         , cpu { model, bus }
         , conventionalMem { baseMemSize }
     {
@@ -215,6 +224,68 @@ public:
     }
 
     virtual void forceRedraw() { }
+
+    bool processEvents(const std::vector<Event>& events)
+    {
+        bool hasMouseEvent = false;
+        for (const auto& evt : events) {
+            switch (evt.type) {
+            case EventType::quit:
+                return false;
+            case EventType::keyboard:
+                keyboardEvent(evt.key);
+                break;
+            case EventType::diskInsert:
+                if (floppy_) {
+                    std::println(stderr, "Inserting in drive {:02X}: {:?}", evt.diskInsert.drive, evt.diskInsert.filename);
+                    floppy_->insertDisk(evt.diskInsert.drive, ReadFile(std::string(evt.diskInsert.filename)));
+                } else {
+                    std::println(stderr, "No floppy drive configured");
+                }
+                break;
+            case EventType::diskEject:
+                if (floppy_) {
+                    std::println(stderr, "Ejecting disk in drive {:02X}", evt.diskEject.drive);
+                    floppy_->insertDisk(evt.diskInsert.drive, "");
+                } else {
+                    std::println(stderr, "No floppy drive configured");
+                }
+                break;
+            case EventType::diskExport: {
+                if (floppy_) {
+                    std::println(stderr, "Exporting disk in drive {:02X}", evt.diskEject.drive);
+                    const auto data = floppy_->exportDisk(evt.diskExport.drive);
+                    if (!data.empty()) {
+                        auto fp = OpenFile(evt.diskExport.filename, "wb");
+                        fwrite(&data[0], 1, data.size(), fp.get());
+                    } else {
+                        std::println(stderr, "Drive {} is empty", evt.diskExport.drive);
+                    }
+                } else {
+                    std::println(stderr, "No floppy drive configured");
+                }
+                break;
+            }
+            case EventType::mouseMove:
+                mouseMoveEvent(evt.mouseMove.dx, evt.mouseMove.dy);
+                hasMouseEvent = true;
+                break;
+            case EventType::mouseButton:
+                mouseButtonEvent(evt.mouseButton.index, evt.mouseButton.down);
+                mouseUpdate();
+                hasMouseEvent = false;
+                break;
+            default:
+                throw std::runtime_error { "TODO: Handle event type " + std::to_string((int)evt.type) };
+            }
+        }
+        if (hasMouseEvent)
+            mouseUpdate();
+        return true;
+    }
+
+protected:
+    NEC765_FloppyController* floppy_ = nullptr;
 };
 
 static constexpr bool isCommPort(uint16_t port)
@@ -283,15 +354,14 @@ public:
             bus,
             [this]() { pic.setInterrupt(PIC_IRQ_FLOPPY); },
             [this](bool isPut, DMAHandler& handler) {
-                assert(!isPut);
-                (void)isPut;
-                dma.startGet(DMA_CHANNEL_FLOPPY, handler);
+                dma.start(DMA_CHANNEL_FLOPPY, handler, isPut);
             },
         }
         , cga { bus }
     {
         bus.setDefaultIOHandler(this);
         cpu.setInterruptFunction([this]() { return pic.getInterrupt(); });
+        floppy_ = &floppy;
     }
     i8259a_PIC pic;
     i8253_PIT pit;
@@ -350,6 +420,34 @@ private:
 
 class CMOS : public IOHandler {
 public:
+    enum : uint8_t {
+        REG_SECONDS, // 0x00
+        REG_ALARM_SECONDS, // 0x01
+        REG_MINUTES, // 0x02
+        REG_ALARM_MINUTES, // 0x03
+        REG_HOURS, // 0x04
+        REG_ALARM_HOURS, // 0x05
+        REG_DAY_OF_WEEK, // 0x06
+        REG_DAY, // 0x07
+        REG_MONTH, // 0x08
+        REG_YEAR, // 0x09
+        REG_STATUS_A, // 0x0A
+        REG_STATUS_B, // 0x0B
+        REG_STATUS_C, // 0x0C
+        REG_STATUS_D, // 0x0D
+        REG_DIAGNOSTICS_STATUS, // 0x0E
+        REG_SHUTDOWN_REASON, // 0x0F
+        REG_FLOPPY_TYPE, // 0x10, Two nibbles: 0=None/1=360/2=1.2/3=720/4=1.44/5=2.88
+        REG_EQUIPMENT = 0x14, // 0x14
+        REG_BASE_MEM_LO, // 0x15
+        REG_BASE_MEM_HI, // 0x16
+        REG_EXT_MEM_LO, // 0x17
+        REG_EXT_MEM_HI, // 0x18
+        REG_EXT_MEM_ALT_LO = 0x30, // 0x30
+        REG_EXT_MEM_ALT_HI, // 0x31
+        REG_CENTURY, // 0x32
+    };
+
     explicit CMOS(SystemBus& bus)
         : data_(128)
     {
@@ -360,6 +458,7 @@ public:
     void reset()
     {
         reg_ = 0;
+        set(REG_STATUS_B, 1 << 1);
     }
 
     void set(uint8_t index, uint8_t value)
@@ -368,12 +467,54 @@ public:
         data_[index] = value;
     }
 
+    uint8_t read(uint8_t reg)
+    {
+        auto toBCD = [](uint32_t val) {
+            return static_cast<uint8_t>((val / 10) << 4 | (val % 10));
+        };
+
+        switch (reg) {
+        case REG_SECONDS:
+            return toBCD(getDateTime().seconds);
+        case REG_MINUTES:
+            return toBCD(getDateTime().minutes);
+        case REG_HOURS:
+            return toBCD(getDateTime().hours);
+            // TODO: 6: DAY OF WEEK (01-07 Sunday=1)
+        case REG_DAY:
+            return toBCD(getDateTime().day);
+        case REG_MONTH:
+            return toBCD(getDateTime().month);
+        case REG_YEAR:
+            return toBCD(getDateTime().year % 100);
+        case REG_CENTURY:
+            return toBCD(getDateTime().year / 100);
+        // Status Register B: return Bit 1 (value = 2): Enables 24 hour format if set
+        // Status Register B: return Bit 2 (value = 4): Enables Binary mode if set (doesn't seem to be supported by bochs)
+        case REG_STATUS_B:
+            return 1 << 1;
+        case REG_STATUS_D:
+            return 0x80; // Status register D: bit 7 = Valid RAM - 1 indicates battery power good
+        default:
+            std::println("CMOS: Read from reg {:02X} -> {:02X}", reg, data_[reg]);
+            [[fallthrough]];
+        case REG_FLOPPY_TYPE:
+        case REG_EQUIPMENT:
+        case REG_BASE_MEM_LO:
+        case REG_BASE_MEM_HI:
+        case REG_EXT_MEM_LO:
+        case REG_EXT_MEM_HI:
+        case REG_EXT_MEM_ALT_LO:
+        case REG_EXT_MEM_ALT_HI:
+            return data_[reg];
+        }
+    }
+
     std::uint8_t inU8(std::uint16_t port, std::uint16_t offset) override
     {
         switch (offset) {
         case 1:
-            std::println("CMOS: Read from reg {:02X} -> {:02X}", reg_ & indexMask, data_[reg_ & indexMask]);
-            return data_[reg_ & indexMask];
+            return read(reg_ & indexMask);
         default:
             std::println("CMOS: TODO!");
             return IOHandler::inU8(port, offset);
@@ -388,8 +529,38 @@ public:
             reg_ = value;
             break;
         case 1:
-            std::println("TODO: CMOS write offset 0x{:02X} value {:02X}", reg_ & indexMask, value);
-            data_[reg_ & indexMask] = value;
+            switch (const auto reg = reg_ & indexMask; reg) {
+            case REG_STATUS_A:
+                data_[reg] = value & 0x7f; // Bit7 is R/O (update in progress)
+                break;
+            case REG_STATUS_B:
+                if (data_[reg] != value) {
+                    std::println("TODO: CMOS write offset 0x{:02X} value {:02X}", reg_ & indexMask, value);
+                    THROW_ONCE();
+                }
+                data_[reg] = value;
+                break;
+            case REG_SECONDS:
+            case REG_MINUTES:
+            case REG_HOURS:
+            case REG_DAY_OF_WEEK:
+            case REG_DAY:
+            case REG_MONTH:
+            case REG_YEAR:
+            case REG_CENTURY:
+                std::println("CMOS: Ignoring date/time setting for now");
+                break;
+            case REG_STATUS_C:
+            case REG_STATUS_D:
+                THROW_ONCE();
+                data_[reg] = value;
+                break;
+            default:
+                std::println("TODO: CMOS write offset 0x{:02X} value {:02X}", reg, value);
+                [[fallthrough]];
+            case REG_SHUTDOWN_REASON:
+                data_[reg] = value;
+            }
             break;
         default:
             IOHandler::outU8(port, offset, value);
@@ -398,8 +569,16 @@ public:
 
 private:
     static constexpr uint8_t indexMask = 127;
+    static constexpr uint8_t STATUS_REG_B_MASK_24HR = 1 << 1;
+    static constexpr uint8_t STATUS_REG_B_MASK_BIN = 1 << 2; // Otherwise BCD
     uint8_t reg_;
     std::vector<uint8_t> data_;
+
+    DateTime getDateTime()
+    {
+        // TODO: Maybe return last time if read was done exactly a second ago?
+        return DateTimeFromEpochTime(CurrentEpochLocalTime());
+    }
 };
 
 class BochsDebugHandler : public IOHandler {
@@ -548,6 +727,7 @@ public:
     }
 
 private:
+    static constexpr uint8_t PORTA_MASK_RESET = 1 << 0;
     static constexpr uint8_t PORTA_MASK_A20 = 1 << 1;
 
     SystemBus& bus_;
@@ -558,7 +738,8 @@ private:
     void setState(bool enabled)
     {
         //std::println("A20 gate {}!", enabled ? "enabled" : "disabled");
-        bus_.setAddressMask(UINT64_MAX & ~(enabled ? 0 : 1 << 20));
+        const uint64_t physicalAddressBits = UINT64_MAX; //((1 << 28) - 1);
+        bus_.setAddressMask(physicalAddressBits & ~(enabled ? 0 : 1 << 20));
         curState_ = enabled;
     }
 
@@ -571,12 +752,100 @@ private:
     }
 };
 
+#if 0
+class PS2_OptionSelect : public IOHandler {
+public:
+    explicit PS2_OptionSelect(SystemBus& bus)
+        : a20control { bus }
+    {
+        bus.addIOHandler(0x090, 0x10, *this);
+        bus.addIOHandler(0x0E0, 0x02, *this);
+        bus.addIOHandler(0x0E8, 0x01, *this);
+        bus.addIOHandler(0x100, 0x08, *this);
+
+        sysboardEnable = 0;
+        std::memset(pos, 0, sizeof(pos));
+        exAddr = 0;
+        std::memset(ex, 0, sizeof(ex));
+        e8 = 0;
+    }
+
+    uint8_t inU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset) override
+    {
+        if (port >= 0x100) {
+            std::println("PS/2 Option Select: Reading POS {}", port - 0x100);
+            return pos[port - 0x100];
+        }
+
+        switch (port) {
+        case PORT_A20_CONTROL: // 092
+            return a20control.inU8(port, offset);
+        case PORT_SYSBOARD_ENABLE: // 094
+            return sysboardEnable;
+        case 0xE0:
+            return exAddr;
+        case 0xE1:
+            return ex[exAddr & 31];
+        case 0xE8:
+            return e8;
+        default:
+            std::println("PS/2 Option Select: TODO: Input from port {:02X}", port);
+            return IOHandler::inU8(port, offset);
+        }
+    }
+
+    void outU8([[maybe_unused]] std::uint16_t port, [[maybe_unused]] std::uint16_t offset, std::uint8_t value) override
+    {
+        if (port >= 0x100) {
+            std::println("PS/2 Option Select: Writing POS {} {:02X}", port - 0x100, value);
+            pos[port - 0x100] = value;
+            return;
+        }
+        switch (port) {
+        case PORT_A20_CONTROL: // 092
+            a20control.outU8(port, offset, value);
+            break;
+        case PORT_SYSBOARD_ENABLE: // 094
+            std::println("PS/2 Option Select: syboard enable: {:02X}", value);
+            sysboardEnable = value & (1 << 7 | 1 << 5);
+            break;
+        case 0xE0:
+            exAddr = value;
+            break;
+        case 0xE1:
+            std::println("PS/2 Option Select: TODO: Output to Ex register {:02X} {:02X}", exAddr, value);
+            if (exAddr < 32)
+                ex[exAddr] = value;
+            break;
+        case 0xE8:
+            std::println("PS/2 Option Select: TODO: Output to E8 {:02X}", value);
+            e8 = value;
+            break;
+        default:
+            std::println("PS/2 Option Select: TODO: Output to port {:02X} {:02X}", port, value);
+            IOHandler::outU8(port, offset, value);
+        }
+    }
+
+    A20Control a20control;
+private:
+    enum : uint8_t {
+        PORT_A20_CONTROL = 0x092,
+        PORT_SYSBOARD_ENABLE = 0x094,
+    };
+    uint8_t sysboardEnable;
+    uint8_t pos[8];
+    uint8_t exAddr;
+    uint8_t ex[32];
+    uint8_t e8;
+};
+#endif
+
 class Clone386Machine : public BaseMachine, public IOHandler {
 public:
     explicit Clone386Machine()
-        : BaseMachine { CPUModel::i80386sx }
+        : BaseMachine { CPUModel::i80386 }
         , extendedMem { 15 * 1024 * 1024 }
-        , a20control { bus }
         , cmos { bus }
         , dma1 { bus, 0x00, 0x80, false }
         , dma2 { bus, 0xC0, 0x88, true }
@@ -589,13 +858,11 @@ public:
                 pic1.setInterrupt(PIC_IRQ_PIT);
             } }
         , ps2 { bus, 
-            [this]() {
-                //std::println("Keyboard interrupt");
-                pic1.setInterrupt(PIC_IRQ_KEYBOARD);
+            [this](bool set) {
+                pic1.setLineState(PIC_IRQ_KEYBOARD, set);
                },
-            [this]() {
-                //std::println("Mouse interrupt");
-                pic2.setInterrupt(PIC_IRQ_MOUSE);
+            [this](bool set) {
+                pic2.setLineState(PIC_IRQ_MOUSE, set);
             },
             [this](bool value) {
                 a20control.setKbdA20Line(value);
@@ -605,24 +872,23 @@ public:
             bus,
             [this]() { pic1.setInterrupt(PIC_IRQ_FLOPPY); },
             [this](bool isPut, DMAHandler& handler) {
-                assert(!isPut);
-                (void)isPut;
-                dma1.startGet(DMA_CHANNEL_FLOPPY, handler);
+                dma1.start(DMA_CHANNEL_FLOPPY, handler, isPut);
             },
             true, // ATA needs ports 0x3f6/0x3f7
         }
-        , ata1 { bus, 0x1f0, 0x3f6, []() {
-                    throw std::runtime_error { "TODO: ATA1 IRQ!" };
+        , ata1 { bus, 0x1f0, 0x3f6, [&](bool set) {
+                    pic2.setLineState(PIC_IRQ_HARDDISK, set);
                 } }
+        , a20control { bus }
     {
         bus.setDefaultIOHandler(this);
         cpu.setInterruptFunction([this]() { return pic1.getInterrupt(); });
         pic1.addSlave(pic2);
         bus.addMemHandler(1024 * 1024, extendedMem.size(), extendedMem);
+        floppy_ = &floppy;
     }
 
     RamHandler extendedMem;
-    A20Control a20control;
     CMOS cmos;
     i8237a_DMAController dma1;
     i8237a_DMAController dma2;
@@ -634,6 +900,8 @@ public:
     NEC765_FloppyController floppy;
     ATAController ata1;
     std::string serialData;
+    A20Control a20control;
+
 
     void forceRedraw() override
     {
@@ -678,10 +946,16 @@ public:
             return 0xFF;
         }
 
+        if (port == 0x1FE || port == 0x421 || port == 0x4A1) { // ?? Win95
+            return /*0xFF*/0;
+        }
+
 
         // Win3.1 install ?? 0x23x is BUS mouse
         // 3BA MDA
-        if ((port >= 0x238 && port <= 0x23F) || port == 0x3BA || port >= 0x1000) {
+        if ((port >= 0x238 && port <= 0x23F) || port == 0x3BA || port >= 0x1000
+            || port == 0x94 || port == 0x102 || port == 0x103 // OS/2 install (various PS/2 registers)
+            ) {
             std::println("Ignoring read from port {:04X}", port);
             return 0xFF;
         }
@@ -718,6 +992,9 @@ public:
         std::println("Ignoring write to port {:02X} value {:02X}", port, value);
         if (isCommPort(port) || isATAPort(port))
             return;
+
+        if (port == 0x190 && value == 0x21)
+            THROW_ONCE();
 
         //switch (port) {
         //case 0x80:
@@ -773,21 +1050,40 @@ void StretchImage(uint32_t* dst, int dstW, int dstH, const uint32_t* src, int sr
     }
 }
 
+[[maybe_unused]] static void TestInst()
+{
+    SystemBus bus;
+    RamHandler ram { 1024 * 1024 };
+    bus.addMemHandler(0, ram.size(), ram);
+    const auto data = HexDecode("b111b8cdabd3e0 f4");
+    for (size_t i = 0; i < data.size(); ++i)
+        bus.writeU8(0xffff0 + i, data[i]);
+    auto cpu = std::make_unique<CPU>(CPUModel::i8088, bus);
+    for (size_t i = 0; i < 10; ++i) {
+        cpu->trace(stdout);
+        try {
+            cpu->step();
+        } catch (const CPUHaltedException&) {
+            break;
+        }
+    }
+    cpu->trace(stdout);
+    exit(0);
+}
+
 int main()
 {
     try {
         extern void TestDebugger();
         TestDebugger();
 
+        //TestInst();
+
         const int guiWidth = 800;
         const int guiHeight = 600;
 
-        GUI gui { guiWidth, guiHeight, 2 };
+        GUI gui { guiWidth, guiHeight, 1 };
         SetGuiActive(true);
-
-        std::function<void(uint8_t, std::string_view)> diskInsertionEvent = [](uint8_t drive, std::string_view filename) {
-            throw std::runtime_error { std::format("No support for disk insertion in drive {:02X} {:?}", drive, filename) };
-        };
 
         Clone386Machine machine;
         machine.video.setDrawFunction([&](const uint32_t* pixels, int w, int h) {
@@ -806,15 +1102,12 @@ int main()
             return;
         });
 
-       // const char* diskName = "../misc/asmtest/egagfx/test.img";
-       //const char* diskName = "../misc/asmtest/mousetest/test.img";
-       const char* diskName = "../misc/asmtest/vgatest/test.img";
-       //const char* diskName = R"(c:\prog\xemu\misc\SW\Microsoft Windows 95 OEM (4.00.950) (3.5)\Bootdisk.img)";
-        //const char* diskName = R"(c:\prog\xemu\misc\SW\Microsoft Mouse 9.00 (1993) (3.5-1.44mb)\DISK01.IMG)";
-        //const char* diskName = R"(c:\prog\xemu\misc\EGA\tests\EGA-FLANDA.img)";
+        // const char* diskName = "../misc/asmtest/egagfx/test.img";
+        // const char* diskName = "../misc/asmtest/mousetest/test.img";
+        const char* diskName = "../misc/asmtest/vgatest/test.img";
        
         try {
-            CreateDisk("hd.bin", diskFormatSL520);
+            CreateDisk("hd.bin", /*diskFormatST1133A*/diskFormatSL520);
             std::println("Created HD");
         } catch (...) {
         }
@@ -826,28 +1119,43 @@ int main()
         auto rom = RomHandler { ReadFile(R"(c:\Tools\bochs-2.7\bios\BIOS-bochs-legacy)") };
         BochsDebugHandler bochsDbgHandler { machine.bus };
         PCIHandler pciHandler { machine.bus };
-        machine.cmos.set(0x10, 0x44); // 2x1.44MB floppy drives
-        machine.cmos.set(0x14, 0b01110101); // Equipment byte (2 floppy drives / bit2 = pointing device installed)
+        machine.cmos.set(CMOS::REG_FLOPPY_TYPE, 0x44); // 2x1.44MB floppy drives
+        machine.cmos.set(CMOS::REG_EQUIPMENT, 0b01110101); // Equipment byte (2 floppy drives / bit2 = pointing device installed)
 
         assert(machine.extendedMem.size() < 16ULL * 1024 * 1024); // TODO: CMOS 0x34/0x35 Extended Mem size in 64K blocks > 16MB
+        const auto baseMemSize = machine.conventionalMem.size() >> 10;
         const auto extMemSize = std::min(size_t(63 * 1024), machine.extendedMem.size() >> 10); // In KB
-        machine.cmos.set(0x30, static_cast<uint8_t>(extMemSize & 0xff));
-        machine.cmos.set(0x31, static_cast<uint8_t>(extMemSize >> 8)); 
 
+        machine.cmos.set(CMOS::REG_BASE_MEM_LO, static_cast<uint8_t>(baseMemSize & 0xff));
+        machine.cmos.set(CMOS::REG_BASE_MEM_HI, static_cast<uint8_t>(baseMemSize >> 8)); 
+
+        // Read by MemMaker / Win95 setup
+        machine.cmos.set(CMOS::REG_EXT_MEM_LO, static_cast<uint8_t>(extMemSize & 0xff));
+        machine.cmos.set(CMOS::REG_EXT_MEM_HI, static_cast<uint8_t>(extMemSize >> 8)); 
+        // Used by BOCHS
+        machine.cmos.set(CMOS::REG_EXT_MEM_ALT_LO, static_cast<uint8_t>(extMemSize & 0xff));
+        machine.cmos.set(CMOS::REG_EXT_MEM_ALT_HI, static_cast<uint8_t>(extMemSize >> 8)); 
 
         machine.floppy.insertDisk(0, ReadFile(diskName));
-        //machine.cmos.set(0x3D, 0x01); // Boot from floppy
+        machine.cmos.set(0x3D, 0x01); // Boot from floppy
         machine.cmos.set(0x3D, 0x02); // Boot from HD
         //machine.cmos.set(0x3D, 0x12); // Boot from floppy then floppy
         //machine.ata1.insertDisk(0, "hd.bin");
         //machine.ata1.insertDisk(0, "win2.bin");
         //machine.ata1.insertDisk(0, "freedos.bin");
         //machine.ata1.insertDisk(0, "win95.bin");
-        machine.ata1.insertDisk(0, "win3.1.bin");
-        //machine.ata1.insertDisk(0, "freedos.bin");
+        //machine.ata1.insertDisk(0, "win3.1.bin");
+        machine.ata1.insertDisk(0, "msdos6.22.bin");
+        machine.cmos.set(0x3F, 0x01); // Fast boot
+
+        machine.cmos.set(0x12, 0xF0); // Drive type 15/extended
+        machine.cmos.set(0x19, 0x2F); // type="User defined"
+        auto hdFmt = machine.ata1.diskFormat(0);
+        machine.cmos.set(0x1B, (uint8_t)hdFmt.numCylinder);
+        machine.cmos.set(0x1D, (uint8_t)hdFmt.headsPerCylinder);
+        machine.cmos.set(0x1F, (uint8_t)hdFmt.sectorsPerTrack);
         
         machine.bus.addMemHandler(0x100000 - rom.size(), rom.size(), rom);
-
 
         // Ignore unmapped ROM area
         struct IgnoredHandler : public MemoryHandler {
@@ -856,18 +1164,10 @@ int main()
             void writeU8([[maybe_unused]] std::uint64_t addr, [[maybe_unused]] std::uint64_t offset, [[maybe_unused]] std::uint8_t value) override { }
         } ignoredHandler {machine.bus, 0xC0000+videoRom.size(), 0x100000 - rom.size() };
 
-        diskInsertionEvent = [&](uint8_t drive, std::string_view filename) {
-            if (!filename.empty()) {
-                std::println("Inserting in drive {:02X}: {:?}", drive, filename);
-                machine.floppy.insertDisk(drive, ReadFile(std::string(filename)));
-            } else {
-                std::println("Ejecting disk in drive {:02X}", drive, filename);
-                machine.floppy.insertDisk(drive, filename);
-
-            }
-        };
-
         Debugger dbg { machine.cpu, machine.bus };
+        dbg.setEventCallback([&](const Event& e) {
+            machine.processEvents({ e });
+        });
         auto& cpu = machine.cpu;
 
         struct DebugBreakHandler : public IOHandler {
@@ -902,50 +1202,17 @@ int main()
         machine.video.registerDebugFunction(dbg);
 
         //dbg.activate();
-        //dbg.addBreakPoint((0xC000 << 4) + 0x448); // POD14_ERR
-        //dbg.addBreakPoint((0xC000 << 4) + 0x4E0); // "HOW_BIG"
-        //dbg.addBreakPoint((0xC000 << 4) + 0x630);
-        //dbg.addBreakPoint((0xC000 << 4) + 0x660); // PODSTG_ERR02251
-        //dbg.addBreakPoint((0xC000 << 4) + 0x5c3);
+        //dbg.addPhysicalBreakPoint(0xF000 * 16 + 0x03E0);
 
+        //machine.cpu.exceptionTraceMask(1 << 0x0D);
         machine.cpu.exceptionTraceMask(0);
 
-        bool quit = false;
-        
-        for (unsigned guiUpdateCnt = 0; !quit;) {
+        for (unsigned guiUpdateCnt = 0;;) {
 
             if (guiUpdateCnt-- == 0) {
                 guiUpdateCnt = 10000;
-                bool hasMouseEvent = false;
-                for (const auto& evt : gui.update()) {
-                    switch (evt.type) {
-                    case GUI::EventType::quit:
-                        quit = true;
-                        break;
-                    case GUI::EventType::keyboard:
-                        machine.keyboardEvent(evt.key);
-                        break;
-                    case GUI::EventType::diskInsert:
-                        diskInsertionEvent(evt.diskInsert.drive, evt.diskInsert.filename);
-                        break;
-                    case GUI::EventType::diskEject:
-                        diskInsertionEvent(evt.diskEject.drive, {});
-                        break;
-                    case GUI::EventType::mouseMove:
-                        machine.mouseMoveEvent(evt.mouseMove.dx, evt.mouseMove.dy);
-                        hasMouseEvent = true;
-                        break;
-                    case GUI::EventType::mouseButton:
-                        machine.mouseButtonEvent(evt.mouseButton.index, evt.mouseButton.down);
-                        machine.mouseUpdate();
-                        hasMouseEvent = false;
-                        break;
-                    default:
-                        throw std::runtime_error { "TODO: Handle event type + " + std::to_string((int)evt.type) };
-                    }
-                }
-                if (hasMouseEvent)
-                    machine.mouseUpdate();
+                if (!machine.processEvents(gui.update()))
+                    break;
             }
 
             #if 0

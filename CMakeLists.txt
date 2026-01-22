@@ -94,6 +94,7 @@ endif()
 
 set(OPCODE_TABLES
     opcodes_8086.cpp
+    opcodes_80286.cpp
     opcodes_80386.cpp
     )
 
@@ -111,6 +112,10 @@ add_library(xemu_core STATIC
     system_bus.cpp system_bus.h
     gzstream.cpp gzstream.h
     debugger.cpp debugger.h
+    event.h
+    disk_format.cpp disk_format.h
+    disk_data.cpp disk_data.h
+    disk_image.cpp disk_image.h
     # Automatically generated
     opcode_types.cpp opcode_types.h
     ${OPCODE_TABLES}
@@ -128,8 +133,6 @@ add_executable(xemu
     ${GUI_SRC} gui.h
     bios_replacement.cpp bios_replacement.h
     keyboard.cpp keyboard.h
-    disk_format.cpp disk_format.h
-    disk_data.cpp disk_data.h
     # Devices
     devs/dma_handler.h
     devs/cga.cpp devs/cga.h devs/cga_font.h

@@ -43,7 +43,7 @@ constexpr uint16_t portAttrAddressData = 0x3C0;
 constexpr uint16_t portAttrDataRead = 0x3C1;
 constexpr uint16_t portAttrInputStatus0 = 0x3C2; // Misc. output when written
 constexpr uint16_t portMiscOutWrite = 0x3C2;
-// 0x3C3 ?
+constexpr uint16_t portVideoSubsystem = 0x3C3;
 constexpr uint16_t portSeqAddress = 0x3C4;
 constexpr uint16_t portSeqData = 0x3C5;
 constexpr uint16_t portPelMask = 0x3C6;
@@ -145,6 +145,34 @@ const char* const crtcRegName[0x19] = {
     "Line Compare Register",
 };
 
+static const char* const crtcRegBits[0x19][8] = {
+    {}, //CRTC_REG_HTOTAL, // 00 -- Horizontal Total Register
+    {}, //CRTC_REG_HDISPEND, // 01 -- End Horizontal Display Register
+    {}, //CRTC_REG_HBSTART, // 02 -- Start Horizontal Blanking Register
+    {}, //CRTC_REG_HBEND, // 03 -- End Horizontal Blanking Register
+    {}, //CRTC_REG_HRSTART, // 04 -- Start Horizontal Retrace Register
+    {}, //CRTC_REG_HREND, // 05 -- End Horizontal Retrace Register
+    {}, //CRTC_REG_VTOTAL, // 06 -- Vertical Total Register
+    {}, //CRTC_REG_OVERFLOW, // 07 -- Overflow Register
+    {}, //CRTC_REG_PRESET_ROW_SCAN, // 08 -- Preset Row Scan Register
+    {}, //CRTC_REG_MAX_SCANLINE, // 09 -- Maximum Scan Line Register
+    {}, //CRTC_REG_CURSOR_START, // 0A -- Cursor Start Register
+    {}, //CRTC_REG_CURSOR_END, // 0B -- Cursor End Register
+    {}, //CRTC_REG_ADDRESS_HIGH, // 0C -- Start Address High Register
+    {}, //CRTC_REG_ADDRESS_LOW, // 0D -- Start Address Low Register
+    {}, //CRTC_REG_CURSOR_HIGH, // 0E -- Cursor Location High Register
+    {}, //CRTC_REG_CURSOR_LOW, // 0F -- Cursor Location Low Register
+    {}, //CRTC_REG_VRSTART, // 10 -- Start Vertical Retrace Register
+    {}, //CRTC_REG_VREND, // 11 -- End Vertical Retrace Register
+    {}, //CRTC_REG_VDEND, // 12 -- Vertical Display End Register
+    {}, //CRTC_REG_OFFSET, // 13 -- Offset Register
+    {nullptr,nullptr,nullptr,nullptr,nullptr,"DIV4","DW"}, //CRTC_REG_UNDERLINE_LOC, // 14 -- Underline Location Register
+    {}, //CRTC_REG_VBSTART, // 15 -- Start Vertical Blanking Register
+    {}, //CRTC_REG_VBEND, // 16 -- End Vertical Blanking Register
+    {"MAP13","MAP14","SLDIV","DIV2",nullptr,"AW","Word/Byte","SE"}, //CRTC_REG_MODE_CONTROL, // 17 -- CRTC Mode Control Register
+    {}, //CRTC_REG_LINE_COMPARE, // 18 -- Line Compare Register
+};
+
 // CRTC_REG_OVERFLOW (07)
 constexpr uint8_t CRTC_OVERFLOW_VT8 = 1 << 0; // Vertical Total (bit 8)
 constexpr uint8_t CRTC_OVERFLOW_VDE8 = 1 << 1; // Vertical Display End (bit 8)
@@ -165,6 +193,10 @@ constexpr uint8_t CRCT_MAX_SCANLINE_SD = 1 << 7;
 constexpr uint8_t CRTC_VREND_MASK = 0xf;
 constexpr uint8_t CRTC_VREND_BANDWIDTH = 1 << 6;
 constexpr uint8_t CRTC_VREND_PROTECT = 1 << 7;
+
+// CRTC_REG_UNDERLINE_LOC (14)
+constexpr uint8_t CRTC_UNDERLINE_DIV4 = 1 << 5; // When this bit is set to 1, the memory-address counter is clocked with the character clock divided by 4
+constexpr uint8_t CRTC_UNDERLINE_DW = 1 << 6; // When this bit is set to 1, memory addresses are doubleword addresses.
 
 // CRTC_REG_MODE_CONTROL (17)
 constexpr uint8_t CRTC_MODE_CONTROL_MASK_MAP13 = 1 << 0; // This bit selects the source of bit 13 of the output multiplexer. When this bit is set to 0, bit 0 of the row scan counter is the source, and when this bit is set to 1, bit 13 of the address counter is the source
@@ -204,6 +236,18 @@ const char* const gcRegName[9] = {
     "Bit Mask Register",
 };
 
+static const char* const gcRegBits[9][8] = {
+    {}, // GC_REG_SET_RESET, // 0
+    {}, // GC_REG_ENABLE_SET_RESET, // 1
+    {}, // GC_REG_COLOR_COMPARE, // 2
+    {}, // GC_REG_DATA_ROTATE, // 3
+    {}, // GC_REG_READ_MAP_SELECT, // 4
+    {"WM0","WM1",nullptr,"ReadMode","Host_O/E","ShiftReg","Shift256"}, // GC_REG_MODE, // 5
+    {"Alpha_dis.","Chain_O/E","MPSEL0","MAPSEL1"}, // GC_REG_MISC, // 6
+    {}, // GC_REG_DONT_CARE, // 7
+    {}, // GC_REG_BIT_MASK, // 8
+};
+
 // GC_REG_MODE (5)
 constexpr uint8_t GC_MODE_MASK_WRITE_MODE = 3 << 0;
 constexpr uint8_t GC_MODE_MASK_READ_MODE = 1 << 3;
@@ -230,12 +274,20 @@ enum : uint8_t {
 };
 static_assert(SEQ_REG_MEM_MODE == 4);
 
-const char* const seqRegName[5] = {
+static const char* const seqRegName[5] = {
     "Reset Register",
     "Clocking Mode Register",
     "Map Mask Register",
     "Character Map Select Register",
     "Sequencer Memory Mode Register",
+};
+
+static const char* const seqRegBits[5][8] = {
+    {"AR","SR"},
+    {"9/8DM", nullptr, "SLR", "DCR", "S4", "SD"},
+    {},
+    {"CSB0","CSB1","CSA0","CSA1","CSB2","CSA2"},
+    {nullptr, "ExtMem", "O/E_Dis", "Chain4"},
 };
 
 // SEQ_REG_RESET (0)
@@ -336,15 +388,24 @@ uint32_t CgaColor(uint8_t value)
     return color;
 }
 
+// static const char* const seqRegBits[5][8]
 template <size_t Size>
-void ShowRegisters(const char* title, const uint8_t (&registers)[Size], const char* const (&names)[Size])
+void ShowRegisters(const char* title, const uint8_t (&registers)[Size], const char* const (&names)[Size], const char* const bits[][8] = nullptr)
 {
     std::println("{} registers:", title);
-    for (size_t i = 0; i < Size; ++i)
-        std::println("{:02X} = {:02X} 0b{:08b} {}", i, registers[i], registers[i], names[i]);
+    for (size_t i = 0; i < Size; ++i) {
+        std::print("{:02X} = {:02X} 0b{:08b} {}", i, registers[i], registers[i], names[i]);
+        if (bits && std::any_of(&bits[i][0], &bits[i][8], [](auto bd) { return bd != nullptr; })) {
+            std::print(":");
+            for (int bit = 8; bit--;) {
+                if (!bits[i][bit])
+                    continue;
+                std::print(" {}={}", bits[i][bit], (registers[i]>>bit)&1);
+            }
+        }
+        std::println("");
+    }
 }
-
-
 } // unnamed namespace
 
 class VGA::impl : public IOHandler, public CycleObserver, public MemoryHandler {
@@ -478,6 +539,7 @@ private:
     void renderFrameGraphics(const uint32_t* palette, const int screenHeight);
 
     void onDebugCommand(DebuggerInterface& dbg);
+    void onDumpText();
 
     void setPaletteComponent(uint8_t reg, uint8_t component, uint8_t value);
     uint8_t getPaletteComponent(uint8_t reg, uint8_t component) const;
@@ -529,6 +591,7 @@ void VGA::impl::reset()
 
     gcAddr_ = 0;
     std::memset(gcReg_, 0, sizeof(gcReg_));
+    gcReg_[GC_REG_DONT_CARE] = 0xf; // Care about all planes
 
     miscOut_ = MISC_OUT_MASK_IO_SELECT;
     featureControl_ = 0;
@@ -717,21 +780,27 @@ void VGA::impl::renderFrameGraphics(const uint32_t* palette, const int screenHei
     if (displayInfo_.dots != 8)
         ERROR("TODO: Graphics mode with dots={}", displayInfo_.dots);
 
-    const uint16_t startAddress = crtcReg_[CRTC_REG_ADDRESS_HIGH] << 8 | crtcReg_[CRTC_REG_ADDRESS_LOW];
+    uint16_t startAddress = crtcReg_[CRTC_REG_ADDRESS_HIGH] << 8 | crtcReg_[CRTC_REG_ADDRESS_LOW];
+    startAddress += (crtcReg_[CRTC_REG_PRESET_ROW_SCAN] >> 5) & 3;
     const uint16_t addressMask = static_cast<uint16_t>(videoMem_.size() - 1);
     const int numChars = (displayInfo_.h.displayEnd + 1);
     const int screenWidth = numChars * displayInfo_.dots;
+    const bool dwordMode = !egaOnly_ && (crtcReg_[CRTC_REG_UNDERLINE_LOC] & CRTC_UNDERLINE_DW);
     const bool wordMode = !(modeControl & CRTC_MODE_CONTROL_MASK_WB);
     const uint16_t rowDelta = crtcReg_[CRTC_REG_OFFSET] * 2;
     const auto colorPlaneEnable = (attrReg_[ATTR_REG_PLANE_ENABLE] & 0xf) | (attrReg_[ATTR_REG_PLANE_ENABLE] & 0xf) << 4;
     const auto shiftInterleaveMode = !!(gcReg_[GC_REG_MODE] & GC_MODE_MASK_SHIFT_REG);
     const auto shift256 = !!(gcReg_[GC_REG_MODE] & GC_MODE_MASK_SHIFT256);
 
+    const uint16_t lineCompare = crtcReg_[CRTC_REG_LINE_COMPARE] | (crtcReg_[CRTC_REG_OVERFLOW] & CRTC_OVERFLOW_LC8 ? 0x100 : 0) | (crtcReg_[CRTC_REG_MAX_SCANLINE] & CRCT_MAX_SCANLINE_LC9 ? 0x200 : 0);
+
     for (int y = 0, row = 0, rowScanCounter = 0; y < screenHeight; ++y) {
         const uint16_t rowStartAddress = static_cast<uint16_t>(startAddress + row * rowDelta);
         for (int ch = 0; ch < numChars; ++ch) {
             uint16_t ma = static_cast<uint16_t>(rowStartAddress + ch);
-            if (wordMode)
+            if (dwordMode)
+                ma = ma << 2; // TODO: is address wrap used?
+            else if (wordMode)
                 ma = (ma << 1) | ((ma >> (modeControl & CRTC_MODE_CONTROL_MASK_AW ? 15 : 13)) & 1);
             if (!(modeControl & CRTC_MODE_CONTROL_MASK_MAP13))
                 ma = (ma & ~(1 << 13)) | (rowScanCounter & 1) << 13;
@@ -745,7 +814,7 @@ void VGA::impl::renderFrameGraphics(const uint32_t* palette, const int screenHei
             constexpr uint8_t mask2 = 0x33;
             if (shift256) {
                 for (int sx = 0; sx < 8; ++sx) {
-                    const uint8_t pixel = videoMem_[((ma + (sx >> 2)) >> 1) & addressMask].planes[sx & 3];
+                    const uint8_t pixel = videoMem_[ma & addressMask].planes[(sx >> 1) & 3];
                     *dest++ = palette[pixel];
                 }
             } else if (shiftInterleaveMode) {
@@ -801,6 +870,11 @@ void VGA::impl::renderFrameGraphics(const uint32_t* palette, const int screenHei
         if (rowScanCounter++ == displayInfo_.charHeight) {
             ++row;
             rowScanCounter = 0;
+        }
+
+        if (y == lineCompare) {
+            row = 0;
+            startAddress = 0;
         }
     }
 
@@ -982,6 +1056,9 @@ std::uint8_t VGA::impl::inU8(std::uint16_t port, [[maybe_unused]] std::uint16_t 
     }        
     case portAttrInputStatus0: // 0x3C2
         return inputStatus0();
+    case portVideoSubsystem: // 0x3C3:
+        LOG("Warning read from port {:03X}", port);
+        return 0;
     case portSeqAddress: // 0x3C4
         return seqAddr_;
     case portSeqData: // 0x3C5
@@ -1063,6 +1140,9 @@ void VGA::impl::outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset,
         LOG("Misc. out {:02X} {:08b}", value, miscOut_);
         miscOut_ = value;
         break;
+    case portVideoSubsystem: // 0x3C3:
+        LOG("Warning write to port {:03X} value {:02X}", port, value);
+        break;
     case portSeqAddress: // 0x3C4
         seqAddr_ = value & 0x1f;
         break;
@@ -1101,9 +1181,10 @@ void VGA::impl::outU8(std::uint16_t port, [[maybe_unused]] std::uint16_t offset,
         }
         if (crtcAddr_ < 8 && (crtcReg_[CRTC_REG_VREND] & CRTC_VREND_PROTECT)) {
             // When this field is set to 1, the CRTC register indexes 00h-07h ignore write access, with the exception of bit 4 of the Overflow Register, which holds bit 8 of the Line Compare field.
-            LOG("Write to protected CRTC register {:02X} value {:02X} 0b{:08b} ({})", crtcAddr_, value, value, RegisterName(crtcRegName, crtcAddr_));
-            if (crtcAddr_ != CRTC_REG_OVERFLOW)
+            if (crtcAddr_ != CRTC_REG_OVERFLOW) {
+                LOG("Write to protected CRTC register {:02X} value {:02X} 0b{:08b} ({})", crtcAddr_, value, value, RegisterName(crtcRegName, crtcAddr_));
                 return;
+            }
             value = (crtcReg_[crtcAddr_] & ~CRTC_OVERFLOW_LC8) | (value & CRTC_OVERFLOW_LC8);
         }
 
@@ -1212,15 +1293,11 @@ uint32_t VGA::impl::mapMem(uint32_t address) const
 
     const auto memMode = seqReg_[SEQ_REG_MEM_MODE];
 
-    if (!(memMode & SEQ_MEM_MODE_MASK_OE_DIS)) {
+    if (memMode & SEQ_MEM_MODE_MASK_CHAIN4)
+        address &= ~3;
+    else if (!(memMode & SEQ_MEM_MODE_MASK_OE_DIS))
         address &= ~1; // TODO: Bit is replaced with "higher order bit"
-    }
 
-    if (memMode & SEQ_MEM_MODE_MASK_CHAIN4) {
-        if (!(memMode & SEQ_MEM_MODE_MASK_OE_DIS))
-            ERROR("TODO: Sequencer Memory Mode 0b{:08b}", seqReg_[SEQ_REG_MEM_MODE]);
-        address >>= 2;
-    }
 
     return address & (videoMem_.size() - 1);
 }
@@ -1244,13 +1321,14 @@ std::uint8_t VGA::impl::readU8(std::uint64_t addr, std::uint64_t)
 
     latch_ = videoMem_[offset];
 
-    //LOG_REG_WRITE("{:06X} read {:08X}", addr, latch_.data);
+    LOG_REG_WRITE("{:06X} read {:08X}", addr, latch_.data);
 
     if (gcReg_[GC_REG_MODE] & GC_MODE_MASK_READ_MODE) {
         uint8_t mismatch = 0;
         for (int plane = 0; plane < 4; ++plane) {
             const int mask = 1 << plane;
-            if (gcReg_[GC_REG_DONT_CARE] & mask)
+            // A zero bit means the plane is excluded(!)
+            if (!(gcReg_[GC_REG_DONT_CARE] & mask))
                 continue;
             const uint8_t pixMask = gcReg_[GC_REG_COLOR_COMPARE] & mask ? 0xFF : 0x00;
             mismatch |= pixMask ^ latch_.planes[plane];
@@ -1268,7 +1346,7 @@ std::uint8_t VGA::impl::readU8(std::uint64_t addr, std::uint64_t)
     }
 }
 
-void VGA::impl::writeU8(std::uint64_t addr, std::uint64_t, std::uint8_t origValue)
+void VGA::impl::writeU8(std::uint64_t addr, std::uint64_t, const std::uint8_t origValue)
 {
     const auto offset = mapMem(static_cast<uint32_t>(addr));
     if (offset == INVALID_OFFSET) {
@@ -1344,6 +1422,7 @@ void VGA::impl::writeU8(std::uint64_t addr, std::uint64_t, std::uint8_t origValu
                     aluResult ^= input;
                     break;
                 }
+
                 // 5. The Bit Mask Register is checked, for each set bit the corresponding bit from the ALU is forwarded.
                 //    If the bit is clear the bit is taken directly from the Latch.
                 aluResult = (aluResult & bitMask) | (latch_.planes[plane] & ~bitMask);
@@ -1355,10 +1434,10 @@ void VGA::impl::writeU8(std::uint64_t addr, std::uint64_t, std::uint8_t origValu
 
     auto planeWriteEnable = seqReg_[SEQ_REG_MAP_MASK] & 0xf;
     
-    if (!(seqReg_[SEQ_REG_MEM_MODE] & SEQ_MEM_MODE_MASK_OE_DIS))
-        planeWriteEnable &= 0b0101 << (addr & 1);
-    else if (seqReg_[SEQ_REG_MEM_MODE] & SEQ_MEM_MODE_MASK_CHAIN4)
+    if (seqReg_[SEQ_REG_MEM_MODE] & SEQ_MEM_MODE_MASK_CHAIN4)
         planeWriteEnable = 1 << (addr & 3);
+    else if (!(seqReg_[SEQ_REG_MEM_MODE] & SEQ_MEM_MODE_MASK_OE_DIS))
+        planeWriteEnable &= 0b0101 << (addr & 1);
 
     auto& pixel = videoMem_[offset];
     for (int plane = 0; plane < 4; ++plane) {
@@ -1367,7 +1446,50 @@ void VGA::impl::writeU8(std::uint64_t addr, std::uint64_t, std::uint8_t origValu
         pixel.planes[plane] = pipelinePixel.planes[plane];
     }
 
-    //LOG_REG_WRITE("{:06X} write {:02X} --> {:08X}", addr, origValue, pixel.data);
+
+    LOG_REG_WRITE("{:06X} write {:02X} --> {:08X}", addr, origValue, pixel.data);
+#if 0
+//extern "C" void __stdcall Sleep(unsigned); // XXX
+
+
+    if (offset >= 0x95b0 && offset < /*0x9650*/ 0x9600) {
+        //LOG_REG_WRITE("{:06X} write {:02X} --> {:08X}", addr, origValue, pixel.data);
+        if (offset == 0x95b0 || offset == 0x95ff) {
+            renderFrame();
+            Sleep(100);
+            __nop();
+        }
+    }
+#endif
+}
+
+void VGA::impl::onDumpText()
+{
+    if (gcReg_[GC_REG_MISC] & GC_MISC_MASK_ALPHA_DIS)
+        throw std::runtime_error { "Not in text mode" };
+
+    const uint32_t startAddress = crtcReg_[CRTC_REG_ADDRESS_HIGH] << 8 | crtcReg_[CRTC_REG_ADDRESS_LOW];
+    const int numColumns = displayInfo_.h.displayEnd + 1;
+    const uint32_t rowOffsetDelta = crtcReg_[CRTC_REG_OFFSET] * 2;
+    const uint32_t charAddrMask = static_cast<uint32_t>(videoMem_.size() - 1);
+    const int fontHeight = displayInfo_.charHeight + 1;
+    const auto modeControl = crtcReg_[CRTC_REG_MODE_CONTROL];
+    const bool scanDouble = !egaOnly_ && (crtcReg_[CRTC_REG_MAX_SCANLINE] & CRCT_MAX_SCANLINE_SD);
+    const int screenHeight = (displayInfo_.v.displayEnd + 1) >> (scanDouble ? 1 : 0);
+
+    uint32_t charAddr = startAddress;
+    for (int y = 0; y + fontHeight <= screenHeight; y += fontHeight, charAddr += rowOffsetDelta) {
+        for (int column = 0; column < numColumns; ++column) {
+            uint16_t ma = static_cast<uint16_t>(charAddr + column);
+            if (!(modeControl & CRTC_MODE_CONTROL_MASK_WB)) // Word mode
+                ma = (ma << 1) | ((ma >> (modeControl & CRTC_MODE_CONTROL_MASK_AW ? 15 : 13)) & 1);
+            auto ch = videoMem_[ma & charAddrMask].planes[0];
+            if (ch < ' ')
+                ch = ' ';
+            std::print("{}", static_cast<char>(ch));
+        }
+        std::println("");
+    }
 }
 
 void VGA::impl::onDebugCommand(DebuggerInterface& dbg)
@@ -1380,6 +1502,10 @@ void VGA::impl::onDebugCommand(DebuggerInterface& dbg)
     constexpr int FLAG_MODE = 1 << 5;
     int showFlag = FLAG_GC | FLAG_SEQ | FLAG_ATTR | FLAG_CRTC | FLAG_EXT | FLAG_MODE;
     if (auto w = dbg.getString(); w) {
+        if (*w == "text") {
+            onDumpText();
+            return;
+        }
         if (*w == "mem") {
             auto addr = dbg.getNumber();
             if (!addr)
@@ -1414,9 +1540,9 @@ void VGA::impl::onDebugCommand(DebuggerInterface& dbg)
             throw std::runtime_error { std::format("Unknown VGA command \"{}\"", *w) };
     }
     if (showFlag & FLAG_SEQ)
-        ShowRegisters("Sequencer", seqReg_, seqRegName);
+        ShowRegisters("Sequencer", seqReg_, seqRegName, seqRegBits);
     if (showFlag & FLAG_CRTC)
-        ShowRegisters("CRTC", crtcReg_, crtcRegName);
+        ShowRegisters("CRTC", crtcReg_, crtcRegName, crtcRegBits);
     if (showFlag & FLAG_EXT) {
         std::println("External registers:");
         std::println("Misc out. {:02X} 0b{:08b}", miscOut_, miscOut_);
@@ -1426,7 +1552,7 @@ void VGA::impl::onDebugCommand(DebuggerInterface& dbg)
     if (showFlag & FLAG_ATTR)
         ShowRegisters("Attribute", attrReg_, attrRegName);
     if (showFlag & FLAG_GC)
-        ShowRegisters("Graphics controller", gcReg_, gcRegName);
+        ShowRegisters("Graphics controller", gcReg_, gcRegName, gcRegBits);
     if (showFlag & FLAG_MODE)
         displayInfo_.log(!(gcReg_[GC_REG_MISC] & GC_MISC_MASK_ALPHA_DIS), attrReg_[ATTR_REG_PLANE_ENABLE]);
 }

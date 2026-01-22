@@ -9,7 +9,7 @@ GUI::GUI([[maybe_unused]] int w, [[maybe_unused]] int h, [[maybe_unused]] int gu
 
 GUI::~GUI() = default;
 
-std::vector<GUI::Event> GUI::update()
+std::vector<Event> GUI::update()
 {
     return {};
 }

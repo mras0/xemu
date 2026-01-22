@@ -161,7 +161,9 @@ public:
 // TODO: Handle case where something straddles two areas
 class SystemBus {
 public:
-    explicit SystemBus() {}
+    explicit SystemBus(uint8_t clockScale = 0)
+        : clockScale_ { clockScale }
+    { }
     SystemBus(const SystemBus&) = delete;
     SystemBus& operator=(const SystemBus&) = delete;
 
@@ -303,6 +305,8 @@ private:
     std::vector<CycleObserver*> cycleObservers_;
     IOHandlerType defaultIoHandler_ {};
     std::uint64_t addressMask_ = UINT64_MAX;
+    std::uint8_t clockScale_;
+    std::uint64_t rawCycles_ = 0;
     std::uint64_t cycles_ = 0;
     std::uint64_t nextAction_ = 0;
 

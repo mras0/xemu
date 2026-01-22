@@ -11,6 +11,8 @@ public:
     ~i8237a_DMAController();
 
     void startGet(uint8_t channel, DMAHandler& handler);
+    void startPut(uint8_t channel, DMAHandler& handler);
+    void start(uint8_t channel, DMAHandler& handler, bool isPut);
 
 private:
     class impl;

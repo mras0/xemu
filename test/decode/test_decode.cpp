@@ -32,7 +32,7 @@ void RunTests(const CPUInfo& cpuInfo, const DecodeTestCase* tests, size_t numTes
                 throw std::runtime_error { "Expected " + std::format("\n{:?}", tc.expected) + " got\n" + std::format("{:?}", str) };
             }
         } catch (const std::exception& e) {
-            throw std::runtime_error { "Test failed for " + std::string { tc.bytesHex } + ": " + e.what() };
+            throw std::runtime_error { "Test failed for " + std::string { tc.bytesHex } + " for " + CPUModelText(cpuInfo.model) + ": " + e.what() };
         }
     }
 }
@@ -72,11 +72,13 @@ void TestDecode16(CPUModel model)
         { "CF", "IRET" },
         { "F6A4003F", "MUL\tBYTE [SI+0x3F00]" },
         { "2EF6FD", "CS IDIV\tCH" },
+        { "9C", "PUSHF" },
+        { "9D", "POPF" },
     };
 
     RunTests(cpuInfo, basic);
 
-    if (model < CPUModel::i80386sx) {
+    if (model < CPUModel::i80286) {
         // Only the two lower bits are used..
         constexpr const DecodeTestCase t8086[] = {
             { "268CB43D01", "MOV\t[ES:SI+0x013D], SS" },
@@ -85,14 +87,29 @@ void TestDecode16(CPUModel model)
         return;
     }
 
+
+    //
+    // 286+
+    //
+    constexpr const DecodeTestCase t286[] = {
+        { "60", "PUSHA" }, // 186+
+        { "61", "POPA" }, // 186+
+        { "0F03D2", "LSL\tDX, DX" },
+        { "0F01E0", "SMSW\tAX" },
+        { "0F00C8", "STR\tAX" },
+        { "8CA19B51", "MOV\t[BX+DI+0x519B], FS" },
+    };
+
+    RunTests(cpuInfo, t286);
+
+    if (model < CPUModel::i80386)
+        return;
+
     //
     // 386+
     //
     constexpr const DecodeTestCase t386[] = {
-        { "0F03D2", "LSL\tDX, DX" }, // 286+
-        { "660F024606", "LAR\tEAX, [BP+0x06]" }, // 286+
-        { "0F01E0", "SMSW\tAX" }, // 286+
-        { "0F00C8", "STR\tAX" }, // 286+
+        { "660F024606", "LAR\tEAX, [BP+0x06]" },
         { "8ED8", "MOV\tDS, AX" },
         { "6631C0", "XOR\tEAX, EAX" },
         { "67C70485000000008BD5", "MOV\tWORD [EAX*4+0x00000000], 0xD58B" },
@@ -106,18 +123,14 @@ void TestDecode16(CPUModel model)
         { "F366AB", "REP STOSD" },
         { "66E806000000", "CALL\t0x0000138D", 0x1381 },
         { "67897302", "MOV\t[EBX+0x02], SI" },
-        { "60", "PUSHA" },
         { "6660", "PUSHAD" },
-        { "61", "POPA" },
         { "6661", "POPAD" },
         { "2E660F011ED31B", "LIDT\t[CS:0x1BD3]" }, // o32 lidt [cs:0x1bd3]
         { "6667399C4D00400000", "CMP\t[EBP+ECX*2+0x00004000], EBX" }, // cmp[ebp + ecx * 2 + 0x4000], ebx
         { "0F22DE", "MOV\tCR3, ESI" },
         { "0F20C0", "MOV\tEAX, CR0" },
         { "EA421D1000", "JMPF\t0x0010:0x1D42" },
-        { "9C", "PUSHF" },
         { "669C", "PUSHFD" },
-        { "9D", "POPF" },
         { "669D", "POPFD" },
         { "66CF", "IRETD" },
         { "0FB5DA", "LGS\tBX, DX" }, // Invalid opcode, but allow decoding
@@ -172,6 +185,7 @@ int main()
 
         TestDecode16(CPUModel::i8088);
         TestDecode16(CPUModel::i8086);
+        TestDecode16(CPUModel::i80286);
         TestDecode16(CPUModel::i80386sx);
         TestDecode32(CPUModel::i80386sx);
     } catch (const std::exception& e){

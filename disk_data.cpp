@@ -2,6 +2,7 @@
 #include <print>
 #include <stdexcept>
 #include <cassert>
+#include <cstring>
 
 namespace {
 
@@ -28,20 +29,25 @@ DiskFormat DiskFormatFromData(const std::vector<uint8_t>& data)
 
 } // unnamed namespace
 
+DiskData::DiskData()
+{
+    eject();
+}
+
 void DiskData::eject()
 {
-    data.clear();
-    format = DiskFormat {};
-    filename.clear();
-    file = nullptr;
+    data_.clear();
+    format_ = DiskFormat {};
+    filename_.clear();
+    file_ = nullptr;
 }
 
 void DiskData::insert(std::vector<uint8_t>&& inData)
 {
     const auto fmt = DiskFormatFromData(inData);
     eject();
-    data = std::move(inData);
-    format = fmt;
+    data_ = std::move(inData);
+    format_ = fmt;
 }
 
 void DiskData::insert(std::string_view diskFilename)
@@ -70,24 +76,52 @@ void DiskData::insert(std::string_view diskFilename)
     DiskFormat fmt = DiskFormatFromData(diskData);
     //LOG("Format: {}/{}/{}", fmt.numCylinder, fmt.headsPerCylinder, fmt.sectorsPerTrack);
     eject();
-    data = std::move(diskData);
-    format = fmt;
-    file = std::move(diskFile);
-    filename = diskFilename;
+    data_ = std::move(diskData);
+    format_ = fmt;
+    file_ = std::move(diskFile);
+    filename_ = diskFilename;
 }
 
 void DiskData::afterWrite(size_t offset, size_t count)
 {
-    assert(offset < data.size() && offset + count <= data.size());
-    if (!file)
+    assert(offset < data_.size() && offset + count <= data_.size());
+    if (!file_)
         return;
-    file->seekp(offset, std::ios::beg);
-    if (!*file)
-        throw std::runtime_error { std::format("File seek failed. Address = {:X} for {:?}.", offset, filename) };
-    file->write(reinterpret_cast<const char*>(&data[offset]), count);
-    if (!*file)
-        throw std::runtime_error { std::format("HD file write failed. Address = {:X} Count = {:X} for {:?}", offset, count, filename) };
+    file_->seekp(offset, std::ios::beg);
+    if (!*file_)
+        throw std::runtime_error { std::format("File seek failed. Address = {:X} for {:?}.", offset, filename_) };
+    file_->write(reinterpret_cast<const char*>(&data_[offset]), count);
+    if (!*file_)
+        throw std::runtime_error { std::format("HD file write failed. Address = {:X} Count = {:X} for {:?}", offset, count, filename_) };
 }
+
+void DiskData::read(void* buffer, size_t offset, size_t count)
+{
+    if (offset > sizeInBytes() || offset + count > sizeInBytes())
+        throw std::runtime_error { std::format("Disk read out of bounds for offset {:X} count {:X} (size {:X})", offset, count, sizeInBytes()) };
+    std::memcpy(buffer, &data_[offset], count);
+}
+
+void DiskData::write(const void* buffer, size_t offset, size_t count)
+{
+    if (offset > sizeInBytes() || offset + count > sizeInBytes())
+        throw std::runtime_error { std::format("Disk write out of bounds for offset {:X} count {:X} (size {:X})", offset, count, sizeInBytes()) };
+    std::memcpy(&data_[offset], buffer, count);
+    afterWrite(offset, count);
+}
+
+uint8_t DiskData::readU8(size_t offset)
+{
+    uint8_t value;
+    read(&value, offset, 1);
+    return value;
+}
+
+void DiskData::writeU8(uint8_t value, size_t offset)
+{
+    write(&value, offset, 1);
+}
+
 
 void CreateDisk(std::string_view filename, const DiskFormat& fmt)
 {
@@ -96,7 +130,6 @@ void CreateDisk(std::string_view filename, const DiskFormat& fmt)
         if (of)
             throw std::runtime_error { std::format("{:?} already exists", filename) };
     }
-
 
     std::vector<char> data(bytesPerSector * 16);
     size_t numBytes = fmt.sizeInBytes();

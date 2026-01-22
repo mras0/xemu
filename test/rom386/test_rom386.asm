@@ -54,6 +54,7 @@ TSS16_SS0 EQU 0x04
 TSS16_SIZE EQU 0x2C
 
 EXCEPTION_UD EQU 6
+EXCEPTION_NM EQU 7
 EXCEPTION_NP EQU 11
 EXCEPTION_GP EQU 13
 EXCEPTION_PF EQU 14
@@ -85,7 +86,6 @@ PAGE_SIZE       EQU 4096
 PT_MASK_P       EQU 1<<0        ; Present
 PT_MASK_W       EQU 1<<1        ; Writable
 PT_MASK_U       EQU 1<<2        ; User
-PF_MASK_I       EQU 1<<4        ; Page fault due to instruction fetch
 
 PAGING_BASE     EQU 0x10000
 
@@ -495,10 +495,13 @@ Entry2:
         lar     edx,eax
         CHECK_CC z
         mov     ecx,[GDT_BASE+GDT_SEL_DATA32+4]
-        ; bits 19:16 are undefined
-        and     ecx,0x00f0ff00
-        and     edx,0xfff0ffff
+        ; bits 19:16 are undefined, but Win95 requires them to the limit bits!!!
+        and     ecx,0x00ffff00
+        ; qemu zeros them out
+        cmp     byte [EMU_ID],EMU_ID_QEMU
+        je      .qskip
         CHECK_EQ edx,ecx
+.qskip:
 
         POST    4
         call    TestV86
@@ -531,6 +534,68 @@ Entry2:
         push    eax
         retf
 .pgdone:
+        POST    9
+
+        mov     ax,GDT_SEL_DATA32
+        mov     ds,ax
+
+        ; Access bit not set
+        test    byte [GDT_BASE+GDT_SEL_SCRATCH+5],GDT_ACCESS_MASK_A
+        CHECK_CC z
+
+        ; Test base + offset wrap
+        GET_LINEAR_BASE ebx
+        mov     eax,ebx
+        add     eax,.afterwrap+50
+        mov     [GDT_BASE+GDT_SEL_SCRATCH+2],ax
+        shr     eax,16
+        mov     [GDT_BASE+GDT_SEL_SCRATCH+4],al
+        jmp     GDT_SEL_SCRATCH:-50
+.afterwrap:
+        add     ebx,.normal
+        push    dword GDT_SEL_CODE32
+        push    ebx
+        retf
+.normal:
+        ; Access bit now set (not set by Qemu/dosbox)
+        cmp     byte [EMU_ID],EMU_ID_OTHER
+        jne     .noa
+        test    byte [GDT_BASE+GDT_SEL_SCRATCH+5],GDT_ACCESS_MASK_A
+        CHECK_CC nz
+.noa:
+
+        ;
+        ; Check #NM
+        ;
+        GET_LINEAR_BASE edi
+%macro CHECK_NM 1+
+        lea     eax,[edi+%%inst]
+        lea     ebx,[edi+%%after]
+%%inst:
+        %1
+        call    PModeFail
+%%after:
+%endmacro
+
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX
+        je      .after_nm
+        SET_HANDLER EXCEPTION_NM,.nm_handler
+        mov     eax,cr0
+        or      al,4
+        mov     cr0,eax
+        jmp     .nm_test
+.nm_handler:
+        CHECK_EQ [esp],eax
+        mov     [esp],ebx
+        iret
+.nm_test:
+        CHECK_NM fadd st0,st1
+        CHECK_NM fsincos
+;        CHECK_NM fwait ; Only if MP and TS set
+        RESTORE_HANDLER EXCEPTION_NM
+.after_nm:
+
+        POST    10
 
         POST    0xff
         mov     si,.alltests
@@ -1825,7 +1890,7 @@ Fail16:
 
 Call16Entry:
         mov     bp,sp
-        cmp     [bp+0],ax       ; IP
+        CHECK_EQ [bp+0],ax       ; IP
         CHECK16_EQ word [bp+2],GDT_SEL_USER16|3 ; CS
         CHECK16_EQ word [bp+4],0xabcd ; param 1
         CHECK16_EQ word [bp+6],0x1234 ; param 2
@@ -1837,6 +1902,20 @@ Call16Entry:
         CHECK16_EQ bp,GDT_SEL_DATA16
         mov     ds,bp ; A selector that's not available for user mode
         retf 4
+
+        bits    32
+Call32Entry:
+        CHECK_EQ [esp],eax ; IP
+        CHECK_EQ dword [esp+4],GDT_SEL_USER16|3 ; CS
+        CHECK_EQ dword [esp+8],0x12345678
+        CHECK_EQ dword [esp+12],STACK2_TOP-4 ; SP
+        CHECK_EQ dword [esp+16],GDT_SEL_UD16|3 ; SS
+        mov     bp,cs
+        CHECK_EQ bp,GDT_SEL_CODE32
+        mov     bp,ss
+        CHECK_EQ bp,GDT_SEL_DATA16
+        retf 4
+        bits    16
 
 Task16:
         mov     ax,.cont1
@@ -1957,6 +2036,38 @@ Task16:
         CHECK16_EQ ax,GDT_SEL_UD16|3
         mov     ax,ds
         CHECK16_EQ ax,0 ; cleared because the call gate loaded DS
+
+        ; Check stack switch even if "RPL" of code segment is 3
+        mov     ax,GDT_SEL_UD16|3
+        mov     ds,ax
+        or      byte [GDT_BASE+GDT_SEL_CALL16+2],3
+        mov     ax,.after_call16_second
+        push    0x1234
+        push    0xabcd
+        call    GDT_SEL_CALL16:0
+.after_call16_second:
+        CHECK16_EQ sp,STACK2_TOP ; parameters are gone from our stack (!)
+        mov     ax,ss
+        CHECK16_EQ ax,GDT_SEL_UD16|3
+
+        mov     ax,GDT_SEL_UD16|3
+        mov     ds,ax
+
+        cmp     byte [EMU_ID],EMU_ID_DOSBOX ; DosBox doesn't like this test..
+        je      .after_call32
+
+        GET_LINEAR_BASE eax
+        add     eax,Call32Entry
+        mov     [GDT_BASE+GDT_SEL_CALL32],ax
+        shr     eax,16
+        mov     [GDT_BASE+GDT_SEL_CALL32+6],ax
+        mov     eax,.after_call32
+        push    dword 0x12345678
+        call    GDT_SEL_CALL32:0x1234
+.after_call32:
+        CHECK16_EQ sp,STACK2_TOP ; parameters are gone
+        mov     ax,ss
+        CHECK16_EQ ax,GDT_SEL_UD16|3
 
         ;
         ; Test GP faults with 16-bit handler
@@ -2085,6 +2196,13 @@ TestGP32:
         mov     dx,GDT_SEL_NULL2
         TEST_GP_32 GDT_SEL_NULL2,mov es,dx
 
+        mov     ax,GDT_SEL_DOWN
+        mov     es,ax
+
+        mov     al,[es:0x8001] ; OK > limit
+        TEST_GP_32 0,mov al,[es:0x8000] ; #GP(0) == limit
+        TEST_GP_32 0,mov al,[es:0x7fff] ; #GP(0) < limit
+
         RESTORE_HANDLER EXCEPTION_GP
         retf
 
@@ -2176,6 +2294,7 @@ TestCrossRead:
         ret
 
 PageFaultHandler:
+        mov     edx,[ss:SCRATCH+4]
         cmp     edx,[esp] ; error code
         je      .ok
         test    edx,edx ; if sign-bit - allow different error code for now...
@@ -2183,7 +2302,8 @@ PageFaultHandler:
 .ok:
         CHECK_EQ eax,[esp+4] ; return address
         mov     eax,cr2
-        CHECK_EQ eax,ecx ; linear address
+        mov     edx,[ss:SCRATCH]
+        CHECK_EQ eax,edx ; linear address
         mov     [esp+4],ebx
         add     esp,4
         iretd
@@ -2271,8 +2391,8 @@ TestPaging1:
 %macro CHECK_PF 3+ ; CR2 / error code
         lea     eax,[ebp+%%inst]
         lea     ebx,[ebp+%%after]
-        mov     ecx,%1
-        mov     edx,%2
+        mov     dword [SCRATCH],%1
+        mov     dword [SCRATCH+4],%2
 %%inst:
         %3
         push    GDT_SEL_DATA32
@@ -2307,6 +2427,37 @@ TestPaging1:
         ; Now a read
         CHECK_PF TEST_PAGE_NP_VIRT,0,mov eax,dword [TEST_PAGE_NP_VIRT-3]
 
+        ; rep + string instruction
+        ; N.B. CHECK_PF sets eax
+        mov     edi,TEST_PAGE2_VIRT+PAGE_SIZE-10
+        push    ds
+        pop     es
+        cld
+        mov     ecx,100
+        CHECK_PF TEST_PAGE2_VIRT+PAGE_SIZE,PT_MASK_W,rep stosb
+        CHECK_EQ edi,TEST_PAGE2_VIRT+PAGE_SIZE
+        CHECK_EQ ecx,100-10
+
+        ; Instruction fetch
+        mov     byte [TEST_PAGE2_VIRT+PAGE_SIZE-1],0xEB
+        mov     eax,TEST_PAGE2_VIRT+PAGE_SIZE-1 ; Failing instruction address
+        lea     ebx,[ebp+.ret1] ; Return here after test
+        lea     ecx,[eax+1] ; CR2
+        xor     edx,edx ; Error code
+        mov     [SCRATCH],ecx
+        mov     [SCRATCH+4],edx
+        push    dword TEST_PAGE2_VIRT+PAGE_SIZE-1
+        ret
+.ret1:
+        mov     eax,TEST_PAGE_NP_VIRT+2
+        lea     ebx,[ebp+.ret2]
+        mov     ecx,eax
+        xor     edx,edx
+        mov     [SCRATCH],ecx
+        mov     [SCRATCH+4],edx
+        push    eax
+        ret
+.ret2:
         ;
         ; Switch to DPL=3
         ;
@@ -2339,10 +2490,12 @@ TestPaging1:
         mov     edi,esp
         mov     esp,TEST_PAGE_NP_VIRT+100
         CHECK_PF TEST_PAGE_NP_VIRT+100-4,PT_MASK_U|PT_MASK_W,push eax
-        mov     eax,esp
-        mov     esp,edi
-        CHECK_EQ eax,TEST_PAGE_NP_VIRT+100
+        CHECK_EQ esp,TEST_PAGE_NP_VIRT+100
 
+        CHECK_PF TEST_PAGE_NP_VIRT+100-4,PT_MASK_U|PT_MASK_W,push ds
+        CHECK_EQ esp,TEST_PAGE_NP_VIRT+100
+
+        mov     esp,edi
         SET_HANDLER EXCEPTION_PF,.cpl0
         mov     al,byte [ds:TEST_PAGE_NP_VIRT]
         call    PModeFail

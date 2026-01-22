@@ -206,6 +206,8 @@ void Disassembler::analyze()
                     nextOffset += 4;
                 break;
             case InstructionMnem::JMP:
+                if (IsRelOp(ins.ea[0].type) && ins.ea[0].immediate == 0) // JMP $+2
+                    break;
                 done = true;
                 [[fallthrough]];
             case InstructionMnem::CALL:
@@ -601,9 +603,27 @@ std::vector<Symbol> ParseSymFile(const std::vector<uint8_t>& data)
     // }
 }
 
+[[maybe_unused]]
+static void foo()
+{
+    uint8_t bootSec[512];
+    auto file = OpenFile(R"(c:\prog\xemu\build\hd.bin)", "rb");
+    fread(bootSec, 1, 512, file.get());
+    Disassembler d { CPUModel::i80386, bootSec, sizeof(bootSec), stdout };
+    d.setRelocBase(0);
+    d.addRoot(0, 2, "Entry");
+    d.addRoot(0x1D, 2, "Entry2");
+    d.analyze();
+    d.print();
+    exit(0);
+}
+
 int main()
 {
     try {
+
+        foo();
+
         // const auto res = Decode(cpuInfo, fetch);
         //  const char* filename = R"(c:\Misc\TASM1\MAKE.EXE)";
         const char* filename = R"(c:\prog\xemu\misc\SW\Win16DDK\Real\WIN386.386)";

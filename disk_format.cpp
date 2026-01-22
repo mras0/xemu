@@ -4,6 +4,7 @@
 
 static const DiskFormat* diskFormats[] = {
     // Floppy formats
+    &diskFormat160K,
     &diskFormat180K,
     &diskFormat360K,
     &diskFormat720K,
@@ -15,20 +16,34 @@ static const DiskFormat* diskFormats[] = {
     &diskFormatSL520,
 };
 
+static const struct {
+    const DiskFormat& format;
+    uint8_t mediaDescriptor;
+} mediaDescriptors[] = {
+    { diskFormat1440K, 0xF0 },
+    { diskFormat720K, 0xF9 },
+    { diskFormat180K, 0xFC },
+    { diskFormat360K, 0xFD },
+    { diskFormat160K, 0xFE },
+};
+
 const DiskFormat& DiskFormatFromMediaDescriptor(uint8_t mediaDescriptor)
 {
-    switch (mediaDescriptor) {
-    case 0xF0:
-        return diskFormat1440K;
-    case 0xF9:
-        return diskFormat720K;
-    case 0xFC:
-        return diskFormat180K;
-    case 0xFD:
-        return diskFormat360K;
-    default:
-        throw std::runtime_error { std::format("Unsupported media descriptor {:02X}", mediaDescriptor ) };
+    for (const auto& md : mediaDescriptors) {
+        if (md.mediaDescriptor == mediaDescriptor)
+            return md.format;
     }
+    throw std::runtime_error { std::format("Unsupported media descriptor {:02X}", mediaDescriptor ) };
+}
+
+uint8_t MediaDescriptorFromFormat(const DiskFormat& fmt)
+{
+    for (const auto& md : mediaDescriptors) {
+        if (md.format == fmt)
+            return md.mediaDescriptor;
+    }
+    // N.B. F8 for harddrives
+    throw std::runtime_error { std::format("Could not determine media descriptor for {}/{}/{}", fmt.numCylinder, fmt.headsPerCylinder, fmt.sectorsPerTrack) };
 }
 
 const DiskFormat& DiskFormatFromBootSector(const uint8_t* data, size_t size)

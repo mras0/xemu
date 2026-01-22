@@ -36,6 +36,23 @@ std::string TrimString(const std::string& s);
 
 std::uint8_t DigitValue(char ch); // 0xFF = invalid number
 
+// Epoch is the standard Unix epoch (00:00:00 UTC on 1 January 1970)
+
+struct DateTime {
+    uint32_t year;
+    uint32_t month; // 1-12
+    uint32_t day; // 1-31
+    uint32_t hours; // 0-23
+    uint32_t minutes; // 0-59
+    uint32_t seconds; // 0-59
+};
+
+int64_t SecondsSinceEpoch(uint32_t Y, uint32_t M, uint32_t D, uint32_t h, uint32_t m, uint32_t s);
+int64_t SecondsSinceEpoch(const DateTime& dt);
+DateTime DateTimeFromEpochTime(int64_t t);
+int64_t CurrentEpochTime();
+int64_t CurrentEpochLocalTime();
+
 void HexDump(uint64_t addr, const void* data, size_t size);
 
 constexpr std::uint64_t SignExtend(std::uint64_t val, std::uint8_t valSize)

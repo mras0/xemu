@@ -11,6 +11,8 @@ struct DiskFormat {
     uint32_t headsPerCylinder; // AKA sides
     uint32_t sectorsPerTrack;
 
+    constexpr bool operator==(const DiskFormat&) const = default;
+
     constexpr uint32_t totalSectors() const
     {
         return numCylinder * headsPerCylinder * sectorsPerTrack;
@@ -33,6 +35,7 @@ struct DiskFormat {
     }
 };
 
+static constexpr DiskFormat diskFormat160K = { 40, 1, 8 }; // 160KB 5.25", 0xFE media descriptor
 static constexpr DiskFormat diskFormat180K = { 40, 1, 9 }; // 180KB 5.25", 0xFC media descriptor
 static constexpr DiskFormat diskFormat360K = { 40, 2, 9 }; // 360KB 5.25", 0xFD media descriptor
 static constexpr DiskFormat diskFormat720K = { 80, 2, 9 }; // 720KB 3.5", 0xF9 media descriptor
@@ -52,6 +55,7 @@ static constexpr DiskFormat diskFormatSL520 {
 };
 
 const DiskFormat& DiskFormatFromMediaDescriptor(uint8_t mediaDescriptor);
+uint8_t MediaDescriptorFromFormat(const DiskFormat& fmt);
 
 const DiskFormat& DiskFormatFromBootSector(const uint8_t* data, size_t size);
 const DiskFormat& DiskFormatFromBootSector(const std::vector<uint8_t>& data);

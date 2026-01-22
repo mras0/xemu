@@ -91,6 +91,7 @@ public:
     void outU16(std::uint16_t port, std::uint16_t offset, std::uint16_t value) override;
 
     void startGet(uint8_t channel, DMAHandler& handler);
+    void startPut(uint8_t channel, DMAHandler& handler);
 
 private:
     SystemBus& bus_;
@@ -141,6 +142,7 @@ private:
 
     void internalWrite8(std::uint16_t port, std::uint16_t regNum, std::uint8_t value);
     uint8_t internalRead8(std::uint16_t regNum);
+    void doDma(bool isPut, uint8_t channel, DMAHandler& handler);
 };
 
 std::uint8_t i8237a_DMAController::impl::internalRead8(std::uint16_t regNum)
@@ -176,6 +178,10 @@ std::uint8_t i8237a_DMAController::impl::inU8(std::uint16_t port, std::uint16_t 
         return pageReg(port);
 
     if (wordMode_) {
+        if (offset < 16) {
+            const auto& reg = offset & 2 ? channels_[offset >> 2].currentCount : channels_[offset >> 2].currentAddress;
+            return static_cast<uint8_t>(reg >> (offset & 1 ? 8 : 0));
+        }
         if (!(offset & 1))
             return internalRead8(offset >> 1);
         throw std::runtime_error { std::format("{}Unsupported 8-bit read from register {:02X} (offset {}) -- wordMode!", desc(), port, offset) };
@@ -246,6 +252,17 @@ void i8237a_DMAController::impl::outU8(std::uint16_t port, std::uint16_t offset,
             internalWrite8(port, regNum, value);
             return;
         }
+        if (offset < 16) {
+            auto& reg = offset & 2 ? channels_[offset >> 2].baseCount : channels_[offset >> 2].baseAddress;
+            auto& reg2 = offset & 2 ? channels_[offset >> 2].currentCount : channels_[offset >> 2].currentAddress;
+            if (offset & 1) {
+                reg2 = reg = (reg & 0xff) | value << 8;
+            } else {
+                reg2 = reg = (reg & 0xff00) | value;
+            }
+            std::println("{}Channel {} setting {} to {:04X} [{}SB]", desc(), offset >> 2, offset & 2 ? "count" : "address", reg, offset & 1 ? 'M' : 'L');
+            return;
+        }
         throw std::runtime_error { std::format("{}Unsupported 8-bit write value {:02X} (0b{:08b}) for port {:04X} {:04b}  -- wordMode", desc(),value, value, port, offset) };
     }
 
@@ -294,11 +311,11 @@ void i8237a_DMAController::impl::outU16(std::uint16_t port, std::uint16_t offset
 }
 
 
-void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
+void i8237a_DMAController::impl::doDma(bool isPut, uint8_t channel, DMAHandler& handler)
 {
     assert(channel < 4);
     auto& ch = channels_[channel];
-    std::println("{}Starting get on channel {} address = 0x{:X} count = 0x{:X}", desc(), channel, ch.currentAddress | ch.page << 16, ch.currentCount);
+    std::println("{}Starting {} on channel {} address = 0x{:X} count = 0x{:X}", desc(), isPut ? "put" : "get", channel, ch.currentAddress | ch.page << 16, ch.currentCount);
 
     if (!enabled_)
         throw std::runtime_error { std::format("DMA: Unsupported write (get) - channel {}, DMA controller disabled", channel) };
@@ -306,11 +323,16 @@ void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
     if (mask_ & (1 << channel))
         throw std::runtime_error { std::format("DMA: Unsupported write (get) - channel {} is currently masked", channel) };
 
-    if ((ch.mode & ~MODE_MASK_AUTO) != (MODE_SINGLE << MODE_BIT_MOD0 | TRA_WRITE << MODE_BIT_TRA0))
-        throw std::runtime_error { std::format("DMA: Unsupported write (get) mode", ModeString(ch.mode)) };
+    const uint8_t expectedMode = MODE_SINGLE << MODE_BIT_MOD0 | (isPut ? TRA_READ : TRA_WRITE) << MODE_BIT_TRA0;
+    if ((ch.mode & ~MODE_MASK_AUTO) != expectedMode)
+        throw std::runtime_error { std::format("DMA: Unsupported mode {} expected {}", ModeString(ch.mode), ModeString(expectedMode)) };
 
     do {
-        bus_.writeU8(ch.currentAddress | ch.page << 16, handler.dmaGetU8());
+        const auto addr = ch.currentAddress | ch.page << 16;
+        if (isPut)
+            handler.dmaPutU8(bus_.readU8(addr));
+        else
+            bus_.writeU8(addr, handler.dmaGetU8());
         ch.currentAddress += 1;
         --ch.currentCount;
     } while (ch.currentCount != 0xFFFF);
@@ -325,6 +347,16 @@ void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
     handler.dmaDone();
 }
 
+void i8237a_DMAController::impl::startGet(uint8_t channel, DMAHandler& handler)
+{
+    doDma(false, channel, handler);
+}
+
+void i8237a_DMAController::impl::startPut(uint8_t channel, DMAHandler& handler)
+{
+    doDma(true, channel, handler);
+}
+
 i8237a_DMAController::i8237a_DMAController(SystemBus& bus, uint16_t ioBase, uint16_t pageIoBase, bool wordMode)
     : impl_ { std::make_unique<impl>(bus, ioBase, pageIoBase, wordMode) }
 {
@@ -334,4 +366,17 @@ i8237a_DMAController::~i8237a_DMAController() = default;
 void i8237a_DMAController::startGet(uint8_t channel, DMAHandler& handler)
 {
     impl_->startGet(channel, handler);
+}
+
+void i8237a_DMAController::startPut(uint8_t channel, DMAHandler& handler)
+{
+    impl_->startPut(channel, handler);
+}
+
+void i8237a_DMAController::start(uint8_t channel, DMAHandler& handler, bool isPut)
+{
+    if (isPut)
+        startPut(channel, handler);
+    else
+        startGet(channel, handler);
 }
